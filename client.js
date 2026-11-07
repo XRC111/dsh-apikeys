@@ -236,7 +236,18 @@ window.__ModuleLoader__.load({
         setAdding(false);
         setNewName('');
         setLocalNote(null);
-        onSelectAccount(name);
+        // Register the account with the Host before selecting it: an account
+        // that exists only in this component's state cannot survive a reload,
+        // and the list the bridge returns would not contain it.
+        onRun('add', async () => {
+          const reply = await callBridge('add-account', { platform: platform.id, account: name });
+          if (reply.ok !== true) {
+            setLocalNote({ tone: 'error', text: reply.message || reply.code || 'failed' });
+            return;
+          }
+          onSelectAccount(name);
+          await refresh();
+        });
       };
 
       const shown = localNote ?? note;

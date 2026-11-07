@@ -77,6 +77,7 @@ All fields are optional; the shipped patch sets the defaults.
 | `defaultPlatform` | `github` | Platform used when a call names none. |
 | `defaultAccount` | `default` | Account used when a call names none. |
 | `enabledPlatforms` | all built-ins | Which built-in platforms to expose. |
+| `accounts` | `[]` | Account names to keep visible before they hold a key. |
 | `customPlatforms` | `[]` | Your own platform definitions. |
 | `exposeKeys` | `true` | Whether `apikey_key get` may return a key value. Set `false` to keep keys inside the Host. |
 | `envFallback` | `true` | Fall back to each platform's environment variable for its default account. |

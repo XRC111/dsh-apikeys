@@ -168,6 +168,20 @@ function readConfig(raw) {
       ? config.enabledPlatforms.map((entry) => String(entry).trim().toLowerCase()).filter(Boolean)
       : Object.keys(BUILTIN_PLATFORMS),
     customPlatforms: Array.isArray(config.customPlatforms) ? config.customPlatforms : [],
+    // Declared account names, so an account can exist before it has a key.
+    // Without this an account only surfaces once a record exists for it, which
+    // makes "add an account, then paste the key" impossible to do in that
+    // order.
+    accounts: Array.isArray(config.accounts)
+      ? config.accounts
+          .map((entry) => {
+            const row = asObject(entry);
+            const platform = normalizeLooseName(row.platform);
+            const name = normalizeAccountName(row.name);
+            return platform === undefined || name === undefined ? undefined : { platform, name };
+          })
+          .filter(Boolean)
+      : [],
     exposeKeys: config.exposeKeys !== false,
     envFallback: config.envFallback !== false,
     maxResponseChars: clamp(toInteger(config.maxResponseChars, 20000), 2000, 400000),
@@ -335,9 +349,16 @@ async function removeKey(ctx, platform, account) {
 }
 
 /** Every account stored for one platform, with state and no values. */
-async function listAccounts(ctx, config, platform) {
+async function listAccounts(ctx, config, platform, declaredAccounts) {
   const credentials = ctx.get('credentials');
   const names = new Set([config.defaultAccount]);
+  for (const declared of config.accounts) {
+    if (declared.platform === platform.id) names.add(declared.name);
+  }
+  // Accounts registered through the settings page before their key was stored.
+  for (const declared of declaredAccounts ?? []) {
+    if (declared.platform === platform.id) names.add(declared.name);
+  }
   const prefix = `${CREDENTIAL_SCOPE}/${platform.id}-`;
 
   if (credentials !== undefined) {
@@ -704,7 +725,7 @@ function renderKey(_args, value) {
  * @param config - normalized row configuration.
  * @param platforms - resolved platform map.
  */
-function registerTools(ctx, config, platforms) {
+function registerTools(ctx, config, platforms, declaredAccounts) {
   const platformIds = [...platforms.keys()];
 
   ctx.tools.register({
@@ -853,7 +874,7 @@ function registerTools(ctx, config, platforms) {
           label: platform.label,
           baseUrl: platform.baseUrl,
           custom: platform.custom === true,
-          accounts: await listAccounts(ctx, config, platform),
+          accounts: await listAccounts(ctx, config, platform, declaredAccounts),
         });
       }
       return {
@@ -1038,7 +1059,7 @@ async function readJson(request) {
 }
 
 /** The bridge surface the Client page uses. */
-function createBridge(ctx, config, platforms, trust) {
+function createBridge(ctx, config, platforms, trust, declaredAccounts) {
   const status = async () => {
     const rows = [];
     for (const platform of platforms.values()) {
@@ -1051,7 +1072,7 @@ function createBridge(ctx, config, platforms, trust) {
         hint: platform.hint,
         note: platform.note,
         envName: platform.envName,
-        accounts: await listAccounts(ctx, config, platform),
+        accounts: await listAccounts(ctx, config, platform, declaredAccounts),
       });
     }
     return {
@@ -1100,6 +1121,28 @@ function createBridge(ctx, config, platforms, trust) {
         return { ok: false, code: 'invalid-account', message: 'account must be lowercase letters and digits' };
       }
       await removeKey(ctx, platform, account);
+      return { ok: true, value: await status() };
+    },
+
+    /**
+     * Register an account name before it has a key.
+     *
+     * An account is otherwise only discoverable through its credential record,
+     * so creating one and then pasting a key — the natural order — used to lose
+     * the account on the next refresh. The registration is kept in memory for
+     * this process only; the account becomes durable as soon as a key is stored.
+     */
+    async addAccount(body) {
+      const { platform, account } = pick(body);
+      if (platform === undefined) {
+        return { ok: false, code: 'unknown-platform', message: 'that platform is not enabled here' };
+      }
+      if (account === undefined) {
+        return { ok: false, code: 'invalid-account', message: 'account must be lowercase letters and digits, at most 32' };
+      }
+      if (!declaredAccounts.some((row) => row.platform === platform.id && row.name === account)) {
+        declaredAccounts.push({ platform: platform.id, name: account });
+      }
       return { ok: true, value: await status() };
     },
 
@@ -1152,6 +1195,7 @@ function createBridge(ctx, config, platforms, trust) {
 
   const routes = [
     ['/status', 'status'],
+    ['/add-account', 'addAccount'],
     ['/set', 'set'],
     ['/clear', 'clear'],
     ['/verify', 'verify'],
@@ -1232,6 +1276,9 @@ async function migrateFromGitHubPlugin(ctx, config) {
 export function apply(ctx, rawConfig) {
   const config = readConfig(rawConfig);
   const platforms = resolvePlatforms(config);
+  // Account names registered from the settings page but not yet backed by a
+  // stored key. Shared by the tools and the bridge so both see the same set.
+  const declaredAccounts = [];
   // Trusted authorities for the key bridge. The deployment's own trusted hosts
   // join this list when the Web startup facts are available; without them the
   // bridge answers loopback requests only.
@@ -1239,14 +1286,14 @@ export function apply(ctx, rawConfig) {
 
   ctx.inject(['tools'], (toolsCtx) => {
     toolsCtx.effect(() => {
-      registerTools(toolsCtx, config, platforms);
+      registerTools(toolsCtx, config, platforms, declaredAccounts);
       return () => {};
     }, 'dsh-apikeys: tools');
   });
 
   ctx.inject(['webServer'], (serverCtx) => {
     serverCtx.effect(() => {
-      const disposers = createBridge(serverCtx, config, platforms, trust)
+      const disposers = createBridge(serverCtx, config, platforms, trust, declaredAccounts)
         .map((route) => serverCtx.webServer.register(route));
       return () => {
         for (const dispose of disposers) dispose();

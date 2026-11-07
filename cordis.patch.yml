@@ -16,6 +16,7 @@
 #   defaultPlatform: github        platform used when a tool call names none
 #   defaultAccount: default        account used when a tool call names none
 #   enabledPlatforms: [...]        built-ins to expose; omit for all of them
+#   accounts: []                   account names to keep visible before they hold a key
 #   customPlatforms: []            your own platforms; see the shape below
 #   exposeKeys: true               allow apikey_key get to return a key value
 #   envFallback: true              fall back to each platform's environment variable
@@ -52,6 +53,7 @@
           - dockerhub
           - huggingface
         customPlatforms: []
+        accounts: []
         exposeKeys: true
         envFallback: true
         maxResponseChars: 20000

@@ -160,7 +160,12 @@ check(
   registered.map((tool) => tool.name).join(',') === 'apikey_call,apikey_platforms,apikey_key',
   'tool names',
 );
-check(routes.length === 4, 'four bridge routes');
+check(routes.length === 5, 'five bridge routes');
+check(
+  routes.map((route) => route.path).join(',')
+    === '/api/dsh-apikeys/status,/api/dsh-apikeys/add-account,/api/dsh-apikeys/set,/api/dsh-apikeys/clear,/api/dsh-apikeys/verify',
+  'bridge paths',
+);
 
 for (const tool of registered) {
   let schemaOk = true;
@@ -347,6 +352,43 @@ const statusReply = await callBridge('/api/dsh-apikeys/status', {});
 check(statusReply.value.ok === true, 'status answers ok');
 check(statusReply.headers['cache-control'] === 'no-store', 'bridge replies are not cached');
 check(statusReply.value.value.defaultPlatform === 'github', 'status reports the default platform');
+
+// An account created from the settings page must exist before it has a key,
+// otherwise it vanishes on the next refresh and cannot be filled in later.
+const beforeAdd = statusReply.value.value.platforms
+  .find((entry) => entry.id === 'vercel').accounts.map((account) => account.name);
+check(!beforeAdd.includes('staging'), 'a new account is absent before it is registered');
+
+const addReply = await callBridge('/api/dsh-apikeys/add-account', { platform: 'vercel', account: 'staging' });
+check(addReply.value.ok === true, 'add-account accepts a new name');
+const afterAdd = addReply.value.value.platforms
+  .find((entry) => entry.id === 'vercel').accounts;
+check(afterAdd.some((account) => account.name === 'staging'), 'the registered account appears in the reply');
+check(
+  afterAdd.find((account) => account.name === 'staging').configured === false,
+  'the registered account reports no key yet',
+);
+
+const reread = await callBridge('/api/dsh-apikeys/status', {});
+const afterReread = reread.value.value.platforms.find((entry) => entry.id === 'vercel').accounts;
+check(afterReread.some((account) => account.name === 'staging'), 'the registered account survives a reload');
+
+const addBad = await callBridge('/api/dsh-apikeys/add-account', { platform: 'vercel', account: 'Bad Name' });
+check(addBad.value.ok === false && addBad.value.code === 'invalid-account', 'add-account refuses an invalid name');
+
+const addUnknownPlatform = await callBridge('/api/dsh-apikeys/add-account', { platform: 'nope', account: 'x' });
+check(
+  addUnknownPlatform.value.ok === false && addUnknownPlatform.value.code === 'unknown-platform',
+  'add-account refuses an unknown platform',
+);
+
+// Storing a key for the registered account keeps it, and it becomes configured.
+await callBridge('/api/dsh-apikeys/set', { platform: 'vercel', account: 'staging', token: 'stagingKey' });
+const afterKey = (await callBridge('/api/dsh-apikeys/status', {})).value.value.platforms
+  .find((entry) => entry.id === 'vercel').accounts.find((account) => account.name === 'staging');
+check(afterKey.configured === true, 'storing a key marks the registered account configured');
+check(records.get('dsh-apikeys/vercel-staging')?.key === 'stagingKey', 'the key landed on the registered account');
+await callBridge('/api/dsh-apikeys/clear', { platform: 'vercel', account: 'staging' });
 
 const setReply = await callBridge('/api/dsh-apikeys/set', { platform: 'vercel', token: 'vercelKey' });
 check(setReply.value.ok === true, 'set through the bridge succeeds');
