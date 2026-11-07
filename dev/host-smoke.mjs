@@ -160,10 +160,10 @@ check(
   registered.map((tool) => tool.name).join(',') === 'apikey_call,apikey_platforms,apikey_key',
   'tool names',
 );
-check(routes.length === 5, 'five bridge routes');
+check(routes.length === 6, 'six bridge routes');
 check(
   routes.map((route) => route.path).join(',')
-    === '/api/dsh-apikeys/status,/api/dsh-apikeys/add-account,/api/dsh-apikeys/set,/api/dsh-apikeys/clear,/api/dsh-apikeys/verify',
+    === '/api/dsh-apikeys/status,/api/dsh-apikeys/add-account,/api/dsh-apikeys/remove-account,/api/dsh-apikeys/set,/api/dsh-apikeys/clear,/api/dsh-apikeys/verify',
   'bridge paths',
 );
 
@@ -388,7 +388,55 @@ const afterKey = (await callBridge('/api/dsh-apikeys/status', {})).value.value.p
   .find((entry) => entry.id === 'vercel').accounts.find((account) => account.name === 'staging');
 check(afterKey.configured === true, 'storing a key marks the registered account configured');
 check(records.get('dsh-apikeys/vercel-staging')?.key === 'stagingKey', 'the key landed on the registered account');
-await callBridge('/api/dsh-apikeys/clear', { platform: 'vercel', account: 'staging' });
+
+// Removing an account must work whether or not it ever held a key.
+const removeUnfilled = await callBridge('/api/dsh-apikeys/remove-account', {
+  platform: 'vercel', account: 'staging',
+});
+check(removeUnfilled.value.ok === true, 'an account can be removed even after it held a key');
+check(records.has('dsh-apikeys/vercel-staging') === false, 'removing the account deleted its record');
+const afterRemove = removeUnfilled.value.value.platforms
+  .find((entry) => entry.id === 'vercel').accounts.map((account) => account.name);
+check(!afterRemove.includes('staging'), 'the removed account is gone from the list');
+
+// The case the UI had no exit for: registered, never filled in.
+await callBridge('/api/dsh-apikeys/add-account', { platform: 'vercel', account: 'emptyone' });
+const beforeRemoveEmpty = (await callBridge('/api/dsh-apikeys/status', {})).value.value.platforms
+  .find((entry) => entry.id === 'vercel').accounts.map((account) => account.name);
+check(beforeRemoveEmpty.includes('emptyone'), 'an unfilled account can be registered');
+const removeEmpty = await callBridge('/api/dsh-apikeys/remove-account', {
+  platform: 'vercel', account: 'emptyone',
+});
+check(removeEmpty.value.ok === true, 'an unfilled account can be removed');
+const afterRemoveEmpty = removeEmpty.value.value.platforms
+  .find((entry) => entry.id === 'vercel').accounts.map((account) => account.name);
+check(!afterRemoveEmpty.includes('emptyone'), 'the unfilled account is gone from the list');
+
+const removeDefault = await callBridge('/api/dsh-apikeys/remove-account', {
+  platform: 'vercel', account: 'default',
+});
+check(
+  removeDefault.value.ok === false && removeDefault.value.code === 'default-account',
+  'the default account is refused',
+);
+check(
+  (await callBridge('/api/dsh-apikeys/status', {})).value.value.platforms
+    .find((entry) => entry.id === 'vercel').accounts.some((account) => account.name === 'default'),
+  'the default account survives the refusal',
+);
+
+const removeUnknown = await callBridge('/api/dsh-apikeys/remove-account', {
+  platform: 'nope', account: 'x',
+});
+check(
+  removeUnknown.value.ok === false && removeUnknown.value.code === 'unknown-platform',
+  'removing from an unknown platform is refused',
+);
+check(
+  (await callBridge('/api/dsh-apikeys/remove-account', { platform: 'vercel', account: 'Bad Name' })).value.code
+    === 'invalid-account',
+  'removing an invalid name is refused',
+);
 
 const setReply = await callBridge('/api/dsh-apikeys/set', { platform: 'vercel', token: 'vercelKey' });
 check(setReply.value.ok === true, 'set through the bridge succeeds');

@@ -1132,6 +1132,37 @@ function createBridge(ctx, config, platforms, trust, declaredAccounts) {
     },
 
     /**
+     * Remove an account outright: its stored key and its registration.
+     *
+     * Withdrawing an account is not the same as clearing its key, and it must
+     * work whether or not a key was ever stored — an account created but never
+     * filled in is exactly the one a user wants to take back. The default
+     * account is refused: unnamed calls fall back to it.
+     */
+    async removeAccount(body) {
+      const { platform, account } = pick(body);
+      if (platform === undefined) {
+        return { ok: false, code: 'unknown-platform', message: 'that platform is not enabled here' };
+      }
+      if (account === undefined) {
+        return { ok: false, code: 'invalid-account', message: 'account must be lowercase letters and digits, at most 32' };
+      }
+      if (account === config.defaultAccount) {
+        return {
+          ok: false,
+          code: 'default-account',
+          message: `"${account}" is this platform's default account and cannot be removed; it is what unnamed calls fall back to`,
+        };
+      }
+      await removeKey(ctx, platform, account);
+      const index = declaredAccounts.findIndex(
+        (row) => row.platform === platform.id && row.name === account,
+      );
+      if (index >= 0) declaredAccounts.splice(index, 1);
+      return { ok: true, value: await status() };
+    },
+
+    /**
      * Register an account name before it has a key.
      *
      * An account is otherwise only discoverable through its credential record,
@@ -1203,6 +1234,7 @@ function createBridge(ctx, config, platforms, trust, declaredAccounts) {
   const routes = [
     ['/status', 'status'],
     ['/add-account', 'addAccount'],
+    ['/remove-account', 'removeAccount'],
     ['/set', 'set'],
     ['/clear', 'clear'],
     ['/verify', 'verify'],

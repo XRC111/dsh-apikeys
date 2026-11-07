@@ -29,7 +29,10 @@ window.__ModuleLoader__.load({
         'account.add': '新增账号',
         'account.confirm': '确认添加',
         'account.adding': '添加中…',
-        'account.remove.hint': '账号无法删除，只能清除它的 Key。',
+        'account.remove': '删除账号',
+        'account.removing': '删除中…',
+        'account.remove.confirm': '删除账号 {name}？它的 Key 也会一并删除。',
+        'account.remove.default': '默认账号不能删除：未指定账号的调用会回退到它',
         'key.label': 'Key',
         'key.placeholder': '粘贴 API Key',
         'key.save': '保存',
@@ -77,7 +80,10 @@ window.__ModuleLoader__.load({
         'account.add': 'Add account',
         'account.confirm': 'Add',
         'account.adding': 'Adding…',
-        'account.remove.hint': 'Accounts cannot be removed; clear the key instead.',
+        'account.remove': 'Remove account',
+        'account.removing': 'Removing…',
+        'account.remove.confirm': 'Remove the account "{name}"? Its key is deleted with it.',
+        'account.remove.default': 'The default account cannot be removed: unnamed calls fall back to it.',
         'key.label': 'Key',
         'key.placeholder': 'Paste an API key',
         'key.save': 'Save',
@@ -211,6 +217,25 @@ window.__ModuleLoader__.load({
         });
       };
 
+      /**
+       * Remove the selected account from the Host entirely: its stored key, if
+       * any, and its registration. The default account cannot be removed — it
+       * is the fallback every unnamed call uses — so the button is disabled
+       * when it is the only account left.
+       */
+      const removeAccount = () => onRun('remove', async () => {
+        const reply = await callBridge('remove-account', { platform: platform.id, account: activeName });
+        if (reply.ok !== true) {
+          setLocalNote({ tone: 'error', text: reply.message || reply.code || 'failed' });
+          return;
+        }
+        setLocalNote(null);
+        // Select something that still exists; the parent picks the default when
+        // the old selection is gone.
+        onSelectAccount(null);
+        await refresh();
+      });
+
       const clearKey = () => onRun('clear', async () => {
         const reply = await callBridge('clear', { platform: platform.id, account: activeName });
         if (reply.ok === true) { setLocalNote(null); await refresh(); }
@@ -311,12 +336,24 @@ window.__ModuleLoader__.load({
             className: 'dak-btn', 'data-kind': 'primary', type: 'button', disabled: busy !== 'idle', onClick: save,
           }, busy === 'save' ? t('key.saving') : t('key.save')),
           h('button', {
-            className: 'dak-btn', type: 'button', disabled: busy !== 'idle' || active.configured !== true, onClick: verify,
+            className: 'dak-btn', type: 'button',
+            disabled: busy !== 'idle' || active.configured !== true,
+            onClick: verify,
           }, busy === 'verify' ? t('key.verifying') : t('key.verify')),
           h('button', {
             className: 'dak-btn', 'data-kind': 'danger', type: 'button',
-            disabled: busy !== 'idle' || active.configured !== true, onClick: clearKey,
-          }, t('key.clear'))),
+            // Removing an account is not conditional on it holding a key: an
+            // account created but never filled in is exactly the one a user
+            // wants to take back.
+            disabled: busy !== 'idle' || (active.isDefault === true && platform.accounts.length <= 1),
+            title: active.isDefault ? t('account.remove.default') : undefined,
+            onClick: () => {
+              // eslint-disable-next-line no-alert
+              if (!globalThis.confirm || globalThis.confirm(t('account.remove.confirm', { name: activeName }))) {
+                removeAccount();
+              }
+            },
+          }, busy === 'remove' ? t('account.removing') : t('account.remove'))),
 
         shown === null ? null : h('p', {
           className: 'dak-note',
