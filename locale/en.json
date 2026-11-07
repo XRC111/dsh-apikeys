@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "GitHub",
+    "description": "Stores GitHub API tokens and gives the model github_api, github_accounts and github_key so it can call the GitHub REST API as you."
+  }
+}

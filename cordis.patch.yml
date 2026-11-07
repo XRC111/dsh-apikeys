@@ -1,0 +1,35 @@
+# dsh-github-plugin — GitHub API tokens for DeepSeek Harness
+#
+# One row. It provides:
+#   * github_api        — call any GitHub REST endpoint with a stored token
+#   * github_accounts   — list accounts and whether each one has a token
+#   * github_key        — get / set / clear one account's token
+#   * /api/dsh-github   — same-origin bridge used by the page at
+#                         Settings → GitHub and 侧栏 插件 → dsh-github-plugin → 配置
+#
+# Tokens live in the Host credential store as `dsh-github/<account>` records.
+# They never appear in this file, in configuration, or in the session log.
+#
+# Config fields (all optional):
+#   baseUrl: https://api.github.com   GitHub API host; GitHub Enterprise Server works too
+#   defaultAccount: default           account used when a tool call names none
+#   exposeKeys: true                  allow github_key get to return the token value
+#   envFallback: true                 fall back to GITHUB_TOKEN while no token is stored
+#   envName: GITHUB_TOKEN             the reference consulted by that fallback
+#   maxResponseChars: 20000           response body cap per call (2000-400000)
+#   requestTimeoutMs: 30000           per-request timeout (1000-180000)
+#   apiVersion: 2022-11-28            X-GitHub-Api-Version header
+#   userAgent: dsh-github             User-Agent header
+- insert:
+    - id: github-tools
+      name: 'dsh-github-plugin'
+      config:
+        baseUrl: https://api.github.com
+        defaultAccount: default
+        exposeKeys: true
+        envFallback: true
+        envName: GITHUB_TOKEN
+        maxResponseChars: 20000
+        requestTimeoutMs: 30000
+        apiVersion: '2022-11-28'
+        userAgent: dsh-github

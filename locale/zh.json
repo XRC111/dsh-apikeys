@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "GitHub",
+    "description": "存放 GitHub API Token，并向模型提供 github_api、github_accounts、github_key 三个工具，让它能以你的身份调用 GitHub。"
+  }
+}

@@ -1,0 +1,96 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        node: [20, 22, 24]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+
+      - name: Syntax check
+        run: |
+          node --check index.js
+          node --check client.js
+
+      - name: Validate package manifest
+        run: |
+          node -e "
+          const fs = require('node:fs');
+          const pkg = JSON.parse(fs.readFileSync('package.json', 'utf8'));
+          const assert = (ok, message) => { if (!ok) { console.error(message); process.exit(1); } };
+          assert(pkg.name === 'dsh-github-plugin', 'unexpected package name');
+          assert(pkg.type === 'module', 'package must be an ES module');
+          assert(pkg.dsh.bundle.patch, 'dsh.bundle.patch is required');
+          assert(pkg.dsh.client.platform === 'web', 'dsh.client.platform must be web');
+          for (const [key, target] of Object.entries(pkg.exports)) {
+            if (!key.includes('*')) assert(fs.existsSync(target), 'missing export target: ' + target);
+          }
+          assert(fs.existsSync(pkg.dsh.bundle.patch), 'missing patch file');
+          console.log('manifest ok');
+          "
+
+      - name: Validate locale resources
+        run: |
+          node -e "
+          const fs = require('node:fs');
+          for (const file of ['locale/en.json', 'locale/zh.json']) {
+            const meta = JSON.parse(fs.readFileSync(file, 'utf8')).meta;
+            if (typeof meta.title !== 'string' || meta.title.length === 0) { console.error(file + ': meta.title is required'); process.exit(1); }
+            if (typeof meta.description !== 'string' || meta.description.length === 0) { console.error(file + ': meta.description is required'); process.exit(1); }
+            console.log(file, 'ok ->', meta.title);
+          }
+          "
+
+      - name: Validate icon
+        run: |
+          node -e "
+          const fs = require('node:fs');
+          const svg = fs.readFileSync('icon.svg', 'utf8').trim();
+          const assert = (ok, message) => { if (!ok) { console.error(message); process.exit(1); } };
+          assert(svg.startsWith('<svg'), 'icon must be an SVG document');
+          assert(svg.endsWith('</svg>'), 'icon must close its root element');
+          assert(!/<script/i.test(svg), 'icon must not carry scripts');
+          assert(Buffer.byteLength(svg) <= 256 * 1024, 'icon exceeds the 256 KiB limit');
+          console.log('icon ok,', Buffer.byteLength(svg), 'bytes');
+          "
+
+      - name: Scan for committed secrets
+        run: |
+          node -e "
+          const fs = require('node:fs');
+          const path = require('node:path');
+          const patterns = [
+            [/gh[pousr]_[A-Za-z0-9]{20,}/, 'GitHub token'],
+            [/github_pat_[A-Za-z0-9_]{20,}/, 'GitHub fine-grained token'],
+            [/sk-[A-Za-z0-9]{20,}/, 'API key'],
+          ];
+          const skip = new Set(['node_modules', '.git']);
+          let hits = 0;
+          const walk = (dir) => {
+            for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+              if (skip.has(entry.name)) continue;
+              const full = path.join(dir, entry.name);
+              if (entry.isDirectory()) { walk(full); continue; }
+              if (!/\.(js|mjs|cjs|json|ya?ml|md|svg|txt)$/.test(entry.name)) continue;
+              const text = fs.readFileSync(full, 'utf8');
+              for (const [pattern, label] of patterns) {
+                if (pattern.test(text)) { console.error('possible ' + label + ' in ' + full); hits += 1; }
+              }
+            }
+          };
+          walk('.');
+          if (hits > 0) process.exit(1);
+          console.log('no secrets found');
+          "
