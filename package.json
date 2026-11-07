@@ -36,12 +36,12 @@
   "author": "XRC111",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/XRC111/dsh-github.git"
+    "url": "git+https://github.com/XRC111/dsh-apikeys.git"
   },
   "bugs": {
-    "url": "https://github.com/XRC111/dsh-github/issues"
+    "url": "https://github.com/XRC111/dsh-apikeys/issues"
   },
-  "homepage": "https://github.com/XRC111/dsh-github#readme",
+  "homepage": "https://github.com/XRC111/dsh-apikeys#readme",
   "engines": {
     "node": ">=20"
   },
