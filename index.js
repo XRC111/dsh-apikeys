@@ -1121,6 +1121,13 @@ function createBridge(ctx, config, platforms, trust, declaredAccounts) {
         return { ok: false, code: 'invalid-account', message: 'account must be lowercase letters and digits' };
       }
       await removeKey(ctx, platform, account);
+      // Clearing a key is how a user retires an account. Drop the registration
+      // too, or the name stays visible with no key and looks like an account
+      // still waiting to be filled in.
+      const index = declaredAccounts.findIndex(
+        (row) => row.platform === platform.id && row.name === account,
+      );
+      if (index >= 0) declaredAccounts.splice(index, 1);
       return { ok: true, value: await status() };
     },
 

@@ -27,6 +27,8 @@ window.__ModuleLoader__.load({
         'account.unset': '未配置',
         'account.new': '新账号名',
         'account.add': '新增账号',
+        'account.confirm': '确认添加',
+        'account.adding': '添加中…',
         'account.remove.hint': '账号无法删除，只能清除它的 Key。',
         'key.label': 'Key',
         'key.placeholder': '粘贴 API Key',
@@ -73,6 +75,8 @@ window.__ModuleLoader__.load({
         'account.unset': 'not configured',
         'account.new': 'New account name',
         'account.add': 'Add account',
+        'account.confirm': 'Add',
+        'account.adding': 'Adding…',
         'account.remove.hint': 'Accounts cannot be removed; clear the key instead.',
         'key.label': 'Key',
         'key.placeholder': 'Paste an API key',
@@ -233,18 +237,18 @@ window.__ModuleLoader__.load({
           setLocalNote({ tone: 'error', text: t('invalid.name') });
           return;
         }
-        setAdding(false);
-        setNewName('');
-        setLocalNote(null);
-        // Register the account with the Host before selecting it: an account
-        // that exists only in this component's state cannot survive a reload,
-        // and the list the bridge returns would not contain it.
+        // Register with the Host first, and only collapse the input once that
+        // succeeded. Closing it up front would clear `adding`, unmount the
+        // input, and let this handler's follow-up run against a stale closure.
         onRun('add', async () => {
           const reply = await callBridge('add-account', { platform: platform.id, account: name });
           if (reply.ok !== true) {
             setLocalNote({ tone: 'error', text: reply.message || reply.code || 'failed' });
             return;
           }
+          setAdding(false);
+          setNewName('');
+          setLocalNote(null);
           onSelectAccount(name);
           await refresh();
         });
@@ -277,8 +281,17 @@ window.__ModuleLoader__.load({
                 placeholder: t('account.new'),
                 'aria-label': t('account.new'),
                 onChange: (event) => setNewName(event.target.value),
-                onKeyDown: (event) => { if (event.key === 'Enter') commitNewAccount(); },
+                onKeyDown: (event) => {
+                  if (event.key === 'Enter') commitNewAccount();
+                  if (event.key === 'Escape') { setAdding(false); setNewName(''); }
+                },
               })
+              : null,
+            adding
+              ? h('button', {
+                className: 'dak-btn', 'data-kind': 'primary', type: 'button',
+                disabled: busy !== 'idle', onClick: commitNewAccount,
+              }, busy === 'add' ? t('account.adding') : t('account.confirm'))
               : h('button', { className: 'dak-btn', type: 'button', onClick: () => setAdding(true) }, t('account.add')))),
 
         h('div', { className: 'dak-row' },
@@ -387,10 +400,14 @@ window.__ModuleLoader__.load({
       const run = (kind, action) => {
         setBusy(kind);
         setNote(null);
-        Promise.resolve()
+        // Keep the failure visible: an error raised by the action belongs to the
+        // user, not to a state reset that a later render would swallow.
+        return Promise.resolve()
           .then(action)
-          .catch((error) => setNote({ tone: 'error', text: String((error && error.message) || error) }))
-          .then(() => setBusy('idle'));
+          .catch((error) => {
+            setNote({ tone: 'error', text: String((error && error.message) || error) });
+          })
+          .finally(() => setBusy('idle'));
       };
 
       return h(
