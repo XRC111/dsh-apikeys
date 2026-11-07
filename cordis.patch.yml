@@ -1,35 +1,60 @@
-# dsh-github-plugin — GitHub API tokens for DeepSeek Harness
+# dsh-apikeys-plugin — API keys for many platforms
 #
 # One row. It provides:
-#   * github_api        — call any GitHub REST endpoint with a stored token
-#   * github_accounts   — list accounts and whether each one has a token
-#   * github_key        — get / set / clear one account's token
-#   * /api/dsh-github   — same-origin bridge used by the page at
-#                         Settings → GitHub and 侧栏 插件 → dsh-github-plugin → 配置
+#   * apikey_call       — call an API on one configured platform with its key
+#   * apikey_platforms  — list platforms and accounts, never values
+#   * apikey_key        — get / set / clear one account's key
+#   * /api/dsh-apikeys  — same-origin bridge used by Settings → API Keys
+#                         and 侧栏 插件 → dsh-apikeys-plugin → 配置
 #
-# Tokens live in the Host credential store as `dsh-github/<account>` records.
-# They never appear in this file, in configuration, or in the session log.
+# Keys are stored in the Host credential store as `dsh-apikeys/<platform>-<account>`
+# records. They never appear in this file, in configuration, or in the session log.
+#
+# Built-in platforms: github, cloudflare, vercel, npm, dockerhub, huggingface.
 #
 # Config fields (all optional):
-#   baseUrl: https://api.github.com   GitHub API host; GitHub Enterprise Server works too
-#   defaultAccount: default           account used when a tool call names none
-#   exposeKeys: true                  allow github_key get to return the token value
-#   envFallback: true                 fall back to GITHUB_TOKEN while no token is stored
-#   envName: GITHUB_TOKEN             the reference consulted by that fallback
-#   maxResponseChars: 20000           response body cap per call (2000-400000)
-#   requestTimeoutMs: 30000           per-request timeout (1000-180000)
-#   apiVersion: 2022-11-28            X-GitHub-Api-Version header
-#   userAgent: dsh-github             User-Agent header
+#   defaultPlatform: github        platform used when a tool call names none
+#   defaultAccount: default        account used when a tool call names none
+#   enabledPlatforms: [...]        built-ins to expose; omit for all of them
+#   customPlatforms: []            your own platforms; see the shape below
+#   exposeKeys: true               allow apikey_key get to return a key value
+#   envFallback: true              fall back to each platform's environment variable
+#   maxResponseChars: 20000        response body cap per call (2000-400000)
+#   requestTimeoutMs: 30000        per-request timeout (1000-180000)
+#   userAgent: dsh-apikeys         User-Agent header
+#   migrateGitHub: true            adopt keys left by the earlier github-only plugin
+#
+# A custom platform row:
+#   customPlatforms:
+#     - id: acme                  # lowercase letters and digits, starting with a letter
+#       label: Acme API
+#       baseUrl: https://api.acme.example/v1
+#       envName: ACME_API_KEY     # optional environment fallback
+#       docs: https://acme.example/keys
+#       verify:                   # optional; without it the page cannot verify
+#         path: /me
+#         identity: data.login    # dotted path into the JSON body
+#       auth:                     # bearer | header | x-api-key | basic | query
+#         kind: bearer
+#         scheme: Bearer
+#       headers: {}               # extra static request headers
 - insert:
-    - id: github-tools
-      name: 'dsh-github-plugin'
+    - id: apikeys
+      name: 'dsh-apikeys-plugin'
       config:
-        baseUrl: https://api.github.com
+        defaultPlatform: github
         defaultAccount: default
+        enabledPlatforms:
+          - github
+          - cloudflare
+          - vercel
+          - npm
+          - dockerhub
+          - huggingface
+        customPlatforms: []
         exposeKeys: true
         envFallback: true
-        envName: GITHUB_TOKEN
         maxResponseChars: 20000
         requestTimeoutMs: 30000
-        apiVersion: '2022-11-28'
-        userAgent: dsh-github
+        userAgent: dsh-apikeys
+        migrateGitHub: true

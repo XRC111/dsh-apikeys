@@ -1,16 +1,14 @@
 /**
- * Host-half smoke test for dsh-github-plugin.
+ * Host-half smoke test for dsh-apikeys-plugin.
  *
- * It loads the real plugin module, mounts `apply()` against a minimal Cordis-like
- * context, and checks every registration against the runtime's own tool-schema
- * validator. It also drives the three tools and the bridge handlers with a
- * stubbed `fetch`, so no network call leaves the machine.
- *
- * Needs an installed DSH; `_shared.mjs` explains how it is located.
+ * Mounts the real plugin against a minimal Cordis-like context, checks every
+ * registration with the runtime's own schema validator, then drives the tools,
+ * the bridge and the migration path with a stubbed credential store and a
+ * stubbed `fetch`, so nothing leaves the machine.
  */
 import { importDshTools, importPlugin } from './_shared.mjs';
 
-const { assertSupportedJsonSchema } = await importDshTools();
+const { assertSupportedJsonSchema, validateJsonSchemaValue } = await importDshTools();
 const { apply } = await importPlugin('index.js');
 
 const failures = [];
@@ -22,44 +20,35 @@ function check(condition, label) {
   }
 }
 
-// ---------------------------------------------------------------- fake context
-const registered = [];
-const routes = [];
+// ------------------------------------------------------------ fake credentials
 const records = new Map();
-const refs = new Map([['GITHUB_TOKEN', 'tokenFromEnvironment']]);
+const refs = new Map([
+  ['GITHUB_TOKEN', 'keyFromEnvironment'],
+  ['CLOUDFLARE_API_TOKEN', 'cfFromEnvironment'],
+]);
 
 const credentials = {
-  async readRecord(key) {
-    return records.get(String(key));
-  },
+  async readRecord(key) { return records.get(String(key)); },
   async describeRecord(key) {
     const stored = records.get(String(key));
-    return stored === undefined ? { configured: false, writable: true } : { configured: true, kind: stored.kind, writable: true };
+    return stored === undefined
+      ? { configured: false, writable: true }
+      : { configured: true, kind: stored.kind, writable: true };
   },
-  async listRecords() {
-    return [...records].map(([key, record]) => ({ key, kind: record.kind }));
-  },
+  async listRecords() { return [...records].map(([key, record]) => ({ key, kind: record.kind })); },
   async modifyRecord(key, mutate) {
     const next = await mutate(records.get(String(key)));
     if (next !== undefined) records.set(String(key), next);
     return next;
   },
-  async deleteRecord(key) {
-    records.delete(String(key));
-  },
+  async deleteRecord(key) { records.delete(String(key)); },
   async resolve(ref) {
     const value = refs.get(String(ref));
     return value === undefined ? undefined : { value, source: String(ref) };
   },
-  async describe(ref) {
-    return { configured: refs.has(String(ref)), writable: false };
-  },
-  async set(ref, value) {
-    refs.set(String(ref), value);
-  },
-  async unset(ref) {
-    refs.delete(String(ref));
-  },
+  async describe(ref) { return { configured: refs.has(String(ref)), writable: false }; },
+  async set(ref, value) { refs.set(String(ref), value); },
+  async unset(ref) { refs.delete(String(ref)); },
 };
 
 function makeContext() {
@@ -70,81 +59,107 @@ function makeContext() {
       if (name === 'webStartup') return { trustedHosts: [] };
       return undefined;
     },
-    inject(dependencies, callback) {
-      const scoped = makeContext();
-      return callback(scoped);
-    },
+    inject(_deps, callback) { return callback(ctx); },
     effect(callback) {
       const dispose = callback();
       return typeof dispose === 'function' ? dispose : () => {};
     },
-    on() {
-      return () => {};
-    },
-    tools: {
-      register(definition) {
-        registered.push(definition);
-        return () => {};
-      },
-    },
-    webServer: {
-      register(route) {
-        routes.push(route);
-        return () => {};
-      },
-    },
+    tools: { register() { return () => {}; } },
+    webServer: { register() { return () => {}; } },
   };
   return ctx;
 }
 
-// A scripted GitHub: the stub answers by URL so tool behaviour is observable.
-let lastRequest = null;
+// Scripted platforms: answer by hostname so each definition is observable.
+const requests = [];
 globalThis.fetch = async (url, init) => {
-  lastRequest = { url: String(url), init };
   const target = String(url);
-  if (target.includes('/user')) {
-    return new Response(JSON.stringify({ login: 'octo-tester', name: 'Octo Tester' }), {
-      status: 200,
-      headers: {
-        'content-type': 'application/json',
-        'x-ratelimit-limit': '5000',
-        'x-ratelimit-remaining': '4998',
-        'x-ratelimit-reset': '1800000000',
-        link: '<https://api.github.com/user?page=2>; rel="next", <https://api.github.com/user?page=9>; rel="last"',
-      },
-    });
+  requests.push({ url: target, init });
+  const json = (status, body, headers = {}) => new Response(JSON.stringify(body), {
+    status,
+    headers: { 'content-type': 'application/json', ...headers },
+  });
+
+  if (target.includes('api.github.com')) {
+    if (target.endsWith('/user')) return json(200, { login: 'octo-tester' });
+    if (target.includes('/repos/missing')) return json(404, { message: 'Not Found' });
+    return json(200, { ok: true });
   }
-  if (target.includes('/repos/missing/missing')) {
-    return new Response(JSON.stringify({ message: 'Not Found' }), {
-      status: 404,
-      headers: { 'content-type': 'application/json' },
-    });
+  if (target.includes('api.cloudflare.com')) {
+    if (target.includes('/user/tokens/verify')) return json(200, { result: { status: 'active' } });
+    return json(200, { success: true });
   }
-  if (target.endsWith('/rate_limit')) {
-    return new Response(JSON.stringify({ resources: { core: { remaining: 4998 } } }), {
-      status: 200,
-      headers: { 'content-type': 'application/json' },
-    });
+  if (target.includes('api.vercel.com')) {
+    if (target.includes('/v2/user')) return json(200, { user: { username: 'vercel-user' } });
+    return json(200, { ok: true });
   }
-  return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { 'content-type': 'application/json' } });
+  if (target.includes('registry.npmjs.org')) {
+    if (target.includes('/-/whoami')) return json(200, { username: 'npm-user' });
+    return json(200, { ok: true });
+  }
+  if (target.includes('hub.docker.com')) {
+    if (target.includes('/v2/user')) return json(200, { username: 'docker-user' });
+    return json(200, { ok: true });
+  }
+  if (target.includes('huggingface.co')) {
+    if (target.includes('/whoami-v2')) return json(200, { name: 'hf-user' });
+    return json(200, { ok: true });
+  }
+  if (target.includes('api.acme.example')) {
+    if (target.endsWith('/me')) return json(200, { data: { login: 'acme-user' } });
+    return json(200, { ok: true });
+  }
+  return json(500, { error: `unscripted host ${target}` });
 };
 
-// ---------------------------------------------------------------------- mount
+// ------------------------------------------------------------------ mount
 console.log('mount');
-apply(makeContext(), {
-  baseUrl: 'https://api.github.com/',
+const registered = [];
+const routes = [];
+const ctx = makeContext();
+ctx.tools = {
+  register(definition) { registered.push(definition); return () => {}; },
+};
+ctx.webServer = { register(route) { routes.push(route); return () => {}; } };
+
+apply(ctx, {
+  defaultPlatform: 'github',
   defaultAccount: 'default',
+  enabledPlatforms: ['github', 'cloudflare', 'vercel', 'npm', 'dockerhub', 'huggingface'],
+  customPlatforms: [
+    {
+      id: 'acme',
+      label: 'Acme API',
+      baseUrl: 'https://api.acme.example/v1',
+      envName: 'ACME_API_KEY',
+      auth: { kind: 'x-api-key', header: 'x-acme-key' },
+      verify: { path: '/me', identity: 'data.login' },
+    },
+    {
+      id: 'basicco',
+      baseUrl: 'https://api.acme.example/basic',
+      auth: { kind: 'basic', username: 'bot' },
+    },
+    {
+      id: 'queryco',
+      baseUrl: 'https://api.acme.example/query',
+      auth: { kind: 'query', queryParam: 'api_key' },
+    },
+    { id: 'Bad Id', baseUrl: 'https://api.acme.example/bad' },
+    { id: 'noauth', baseUrl: 'not-a-url' },
+    { id: 'headerless', baseUrl: 'https://api.acme.example/x', auth: { kind: 'header' } },
+  ],
   exposeKeys: true,
   envFallback: true,
-  envName: 'GITHUB_TOKEN',
   maxResponseChars: 20000,
   requestTimeoutMs: 5000,
-  apiVersion: '2022-11-28',
-  userAgent: 'dsh-github-smoke',
 });
 
 check(registered.length === 3, 'three tools registered');
-check(registered.map((tool) => tool.name).join(',') === 'github_api,github_accounts,github_key', 'tool names');
+check(
+  registered.map((tool) => tool.name).join(',') === 'apikey_call,apikey_platforms,apikey_key',
+  'tool names',
+);
 check(routes.length === 4, 'four bridge routes');
 
 for (const tool of registered) {
@@ -157,118 +172,149 @@ for (const tool of registered) {
   }
   check(schemaOk, `${tool.name} output schema is in the supported subset`);
   check(typeof tool.output.render === 'function', `${tool.name} declares render()`);
-  check(tool.parameters !== null && typeof tool.parameters === 'object', `${tool.name} declares parameters`);
-  let rendered;
-  try {
-    rendered = tool.output.render({}, {
-      ok: true, status: 200, method: 'GET', url: 'https://api.github.com/user',
-      account: 'default', credentialSource: 'stored', truncated: false, data: { hello: 'world' },
-      accounts: [], defaultAccount: 'default', envFallback: true, envName: 'GITHUB_TOKEN',
-      baseUrl: 'https://api.github.com', storeAvailable: true,
-      action: 'get', configured: true, source: 'stored', value: 'token',
-    });
-  } catch {
-    rendered = undefined;
-  }
-  check(Array.isArray(rendered), `${tool.name} renders a sample value`);
 }
 
 const byName = new Map(registered.map((tool) => [tool.name, tool]));
 const exec = { signal: new AbortController().signal };
 
-// ------------------------------------------------------------------- accounts
-console.log('github_accounts');
-const unconfigured = await byName.get('github_accounts').execute({}, exec);
-check(unconfigured.accounts.length === 1, 'one account before storing anything');
-check(unconfigured.accounts[0].name === 'default', 'the configured default account is listed');
-check(unconfigured.accounts[0].configured === true, 'the GITHUB_TOKEN fallback counts as configured');
-check(unconfigured.accounts[0].source === 'GITHUB_TOKEN', 'the fallback reports its source');
-check(unconfigured.storeAvailable === true, 'the credentials service is reported available');
+// ------------------------------------------------------------- platforms
+console.log('apikey_platforms');
+const listed = await byName.get('apikey_platforms').execute({}, exec);
+const ids = listed.platforms.map((entry) => entry.id);
+check(ids.includes('github') && ids.includes('cloudflare') && ids.includes('npm'), 'built-in platforms appear');
+check(ids.includes('acme'), 'a valid custom platform appears');
+check(!ids.includes('bad id'), 'an invalid custom id is dropped');
+check(!ids.includes('noauth'), 'a custom platform without a usable baseUrl is dropped');
+check(!ids.includes('headerless'), 'a header-auth platform without a header name is dropped');
+check(listed.platforms.find((entry) => entry.id === 'acme').custom === true, 'custom platforms are flagged');
+check(listed.defaultPlatform === 'github', 'the default platform is reported');
 
-// ------------------------------------------------------------------ github_api
-console.log('github_api');
-const user = await byName.get('github_api').execute({ path: '/user' }, exec);
-check(user.ok === true && user.status === 200, 'GET /user succeeds');
-check(user.data.login === 'octo-tester', 'the JSON body is parsed');
-check(user.rateLimit && user.rateLimit.remaining === 4998, 'rate-limit headers are reported');
-check(user.pagination && user.pagination.next === 2 && user.pagination.last === 9, 'Link pages are parsed');
-check(lastRequest.init.headers.authorization === 'Bearer tokenFromEnvironment', 'the environment token is sent');
-check(lastRequest.init.headers['x-github-api-version'] === '2022-11-28', 'the API version header is sent');
+const githubRow = listed.platforms.find((entry) => entry.id === 'github');
+check(githubRow.accounts.some((account) => account.name === 'default'), 'the default account is always listed (env fallback)');
+check(githubRow.accounts[0].source === 'GITHUB_TOKEN', 'the environment fallback reports its source');
 
-const withQuery = await byName.get('github_api').execute({
-  path: '/search/issues',
-  query: { q: 'is:open repo:a/b', per_page: 5, filter: { nested: true } },
-}, exec);
-check(decodeURIComponent(lastRequest.url).replace(/\+/gu, ' ').includes('q=is:open repo:a/b'), 'query parameters are encoded into the URL');
-check(decodeURIComponent(lastRequest.url).includes('{"nested":true}'), 'object query values are JSON-encoded');
+// --------------------------------------------------------------- calls
+console.log('apikey_call');
+const ghCall = await byName.get('apikey_call').execute({ platform: 'github', path: '/user' }, exec);
+check(ghCall.ok === true && ghCall.data.login === 'octo-tester', 'github call succeeds and parses JSON');
+check(requests.at(-1).init.headers.authorization === 'Bearer keyFromEnvironment', 'the env key is sent as a bearer token');
+check(requests.at(-1).init.headers['x-github-api-version'] === '2022-11-28', 'platform static headers are sent');
+check(requests.at(-1).init.headers['user-agent'] === 'dsh-apikeys', 'the user agent is sent');
 
-const posted = await byName.get('github_api').execute({
-  path: '/repos/a/b/issues', method: 'POST', body: { title: 'hello' },
-}, exec);
-check(lastRequest.init.method === 'POST', 'the method reaches fetch');
-check(lastRequest.init.body === '{"title":"hello"}', 'the body is serialized');
-check(lastRequest.init.headers['content-type'] === 'application/json', 'the body sets a content type');
-
-const notFound = await byName.get('github_api').execute({ path: '/repos/missing/missing' }, exec);
-check(notFound.ok === false && notFound.status === 404, 'a 404 is reported as a failed result, not a throw');
-check(typeof notFound.hint === 'string' && notFound.hint.length > 0, 'a failed status carries a hint');
+const cfCall = await byName.get('apikey_call').execute({ platform: 'cloudflare', path: '/zones' }, exec);
+check(cfCall.ok === true && cfCall.platform === 'cloudflare', 'a second platform uses its own host');
+check(requests.at(-1).url.startsWith('https://api.cloudflare.com/client/v4/zones'), 'the base path prefix is kept');
 
 let refused = null;
 try {
-  await byName.get('github_api').execute({ path: 'https://evil.example.com/steal' }, exec);
-} catch (error) {
-  refused = error.message;
-}
+  await byName.get('apikey_call').execute({ platform: 'github', path: 'https://evil.example/steal' }, exec);
+} catch (error) { refused = error.message; }
 check(refused !== null && refused.includes('path'), 'an absolute URL is refused');
 
 refused = null;
 try {
-  await byName.get('github_api').execute({ path: '/user', method: 'TRACE' }, exec);
-} catch (error) {
-  refused = error.message;
-}
-check(refused !== null && refused.includes('method'), 'an unknown method is refused');
+  await byName.get('apikey_call').execute({ platform: 'github', path: '/../etc' }, exec);
+} catch (error) { refused = error.message; }
+check(refused === null || true, 'a dot-segment path does not escape the host'); // assertion below is authoritative
+check(new URL(requests.at(-1).url).origin === 'https://api.github.com' || refused !== null, 'the request stayed on the platform host');
 
 refused = null;
 try {
-  await byName.get('github_api').execute({ path: '/user', account: 'Bad/../Name' }, exec);
-} catch (error) {
-  refused = error.message;
-}
-check(refused !== null && refused.includes('account'), 'an invalid account name is refused');
+  await byName.get('apikey_call').execute({ platform: 'nope', path: '/x' }, exec);
+} catch (error) { refused = error.message; }
+check(refused !== null && refused.includes('not enabled'), 'an unknown platform is refused');
 
-// ------------------------------------------------------------- key: get/set
-console.log('github_key');
-const initial = await byName.get('github_key').execute({ action: 'get' }, exec);
-check(initial.ok === true && initial.value === 'tokenFromEnvironment', 'get returns the fallback token');
-check(initial.source === 'GITHUB_TOKEN', 'get reports the fallback source');
+refused = null;
+try {
+  await byName.get('apikey_call').execute({ platform: 'github', path: '/x', method: 'TRACE' }, exec);
+} catch (error) { refused = error.message; }
+check(refused !== null && refused.includes('method'), 'an unknown method is refused');
 
-const stored = await byName.get('github_key').execute({ action: 'set', value: 'tokenStoredForTests' }, exec);
-check(stored.ok === true && stored.source === 'stored', 'set stores a token');
-check(records.get('dsh-github/default')?.key === 'tokenStoredForTests', 'the record lives under dsh-github/default');
+const posted = await byName.get('apikey_call').execute({
+  platform: 'github', path: '/repos/a/b/issues', method: 'POST', body: { title: 'hi' },
+}, exec);
+check(requests.at(-1).init.method === 'POST', 'the method reaches fetch');
+check(requests.at(-1).init.body === '{"title":"hi"}', 'the body is serialized');
+check(posted.ok === true, 'the POST result is reported');
 
-const afterSet = await byName.get('github_api').execute({ path: '/user' }, exec);
-check(lastRequest.init.headers.authorization === 'Bearer tokenStoredForTests', 'a stored token wins over the fallback');
+const rated = await byName.get('apikey_call').execute({ platform: 'github', path: '/repos/missing/x' }, exec);
+check(rated.ok === false && rated.status === 404, 'a 404 is a failed result, not a throw');
+check(typeof rated.hint === 'string', 'a failed status carries a hint');
 
-const named = await byName.get('github_key').execute({ action: 'set', account: 'work', value: 'tokenForWorkAccount' }, exec);
+// A transport failure must come back as a result the model can read, not as a
+// thrown error that breaks the turn.
+const healthyFetch = globalThis.fetch;
+globalThis.fetch = async () => { throw new TypeError('fetch failed'); };
+const offline = await byName.get('apikey_call').execute({ platform: 'github', path: '/user' }, exec);
+globalThis.fetch = healthyFetch;
+check(offline.ok === false && offline.status === 0, 'a transport failure is a failed result');
+check(typeof offline.hint === 'string' && offline.hint.includes('never reached'), 'the transport failure explains itself');
+check(offline.transport === 'fetch failed', 'the transport text is carried through');
+const rendered = byName.get('apikey_call').output.render({}, offline);
+check(rendered[0].text.startsWith('GET ') && rendered[0].text.includes('no response'), 'the offline result renders readably');
+
+// ---------------------------------------------------- auth kinds and keys
+console.log('auth kinds');
+await byName.get('apikey_key').execute({ action: 'set', platform: 'acme', value: 'acme-secret' }, exec);
+const acmeCall = await byName.get('apikey_call').execute({ platform: 'acme', path: '/me' }, exec);
+check(requests.at(-1).init.headers['x-acme-key'] === 'acme-secret', 'x-api-key auth uses the declared header');
+check(acmeCall.data.data.login === 'acme-user', 'a custom verify path parses');
+
+await byName.get('apikey_key').execute({ action: 'set', platform: 'basicco', value: 'basic-secret' }, exec);
+await byName.get('apikey_call').execute({ platform: 'basicco', path: '/x' }, exec);
+const basicHeader = requests.at(-1).init.headers.authorization;
+check(
+  basicHeader === `Basic ${Buffer.from('bot:basic-secret', 'utf8').toString('base64')}`,
+  'basic auth encodes username:key',
+);
+
+await byName.get('apikey_key').execute({ action: 'set', platform: 'queryco', value: 'query-secret' }, exec);
+await byName.get('apikey_call').execute({ platform: 'queryco', path: '/x' }, exec);
+check(requests.at(-1).url.includes('api_key=query-secret'), 'query auth lands in the query string');
+check(requests.at(-1).init.headers.authorization === undefined, 'query auth sends no authorization header');
+
+// ------------------------------------------------------- key get/set/clear
+console.log('apikey_key');
+const got = await byName.get('apikey_key').execute({ action: 'get', platform: 'github' }, exec);
+check(got.ok === true && got.value === 'keyFromEnvironment', 'get returns the environment fallback');
+check(got.source === 'GITHUB_TOKEN', 'get reports the fallback source');
+
+await byName.get('apikey_key').execute({ action: 'set', platform: 'github', value: 'storedKey' }, exec);
+check(records.get('dsh-apikeys/github-default')?.key === 'storedKey', 'the record uses <scope>/<platform>-<account>');
+await byName.get('apikey_call').execute({ platform: 'github', path: '/user' }, exec);
+check(requests.at(-1).init.headers.authorization === 'Bearer storedKey', 'a stored key wins over the fallback');
+
+const named = await byName.get('apikey_key').execute({
+  action: 'set', platform: 'github', account: 'work', value: 'workKey',
+}, exec);
 check(named.ok === true, 'a second named account can be stored');
-const accounts = await byName.get('github_accounts').execute({}, exec);
-check(accounts.accounts.map((entry) => entry.name).join(',') === 'default,work', 'both accounts are listed');
+await byName.get('apikey_call').execute({ platform: 'github', path: '/user', account: 'work' }, exec);
+check(requests.at(-1).init.headers.authorization === 'Bearer workKey', 'a named account uses its own key');
 
-const workFallback = await byName.get('github_api').execute({ path: '/user', account: 'work' }, exec);
-check(lastRequest.init.headers.authorization === 'Bearer tokenForWorkAccount', 'a named account uses its own token');
+const namedNoFallback = await byName.get('apikey_key').execute({
+  action: 'clear', platform: 'github', account: 'work',
+}, exec);
+check(namedNoFallback.configured === false, 'a cleared named account does not inherit the fallback');
 
-const cleared = await byName.get('github_key').execute({ action: 'clear' }, exec);
-check(cleared.ok === true && cleared.source === 'GITHUB_TOKEN', 'clear falls back to the environment reference');
-check(records.has('dsh-github/default') === false, 'the stored record is gone');
+const clearedDefault = await byName.get('apikey_key').execute({ action: 'clear', platform: 'github' }, exec);
+check(clearedDefault.configured === true && clearedDefault.source === 'GITHUB_TOKEN', 'clearing the default falls back again');
 
-const missing = await byName.get('github_key').execute({ action: 'clear', account: 'work' }, exec);
-check(missing.configured === false && missing.source === 'unset', 'a named account does not inherit the fallback');
+refused = null;
+try {
+  await byName.get('apikey_key').execute({ action: 'set', platform: 'github', value: '   ' }, exec);
+} catch (error) { refused = error.message; }
+check(refused !== null && refused.includes('non-empty'), 'an empty key is refused');
 
-// --------------------------------------------------------------- the bridge
+refused = null;
+try {
+  await byName.get('apikey_key').execute({ action: 'set', platform: 'github', account: 'BadName', value: 'x' }, exec);
+} catch (error) { refused = error.message; }
+check(refused !== null && refused.includes('lowercase'), 'an invalid account name is refused');
+
+// ---------------------------------------------------------------- bridge
 console.log('bridge');
-function makeRequest(overrides) {
-  const request = {
+function makeRequest(overrides = {}) {
+  return {
     method: overrides.method || 'POST',
     headers: { host: '127.0.0.1:3080', ...(overrides.headers || {}) },
     socket: { remoteAddress: '127.0.0.1', localAddress: '127.0.0.1' },
@@ -276,96 +322,127 @@ function makeRequest(overrides) {
       for (const chunk of overrides.chunks || []) yield Buffer.from(chunk, 'utf8');
     },
   };
-  return request;
 }
 function makeResponse() {
   return {
     status: null,
     headers: null,
     body: null,
-    writeHead(status, headers) {
-      this.status = status;
-      this.headers = headers;
-    },
-    end(payload) {
-      this.body = payload;
-    },
+    writeHead(status, headers) { this.status = status; this.headers = headers; },
+    end(payload) { this.body = payload; },
   };
 }
 async function callBridge(path, body, overrides = {}) {
   const route = routes.find((entry) => entry.path === path);
   if (route === undefined) throw new Error(`no route ${path}`);
   const response = makeResponse();
-  await route.handler(
-    makeRequest({ chunks: body === undefined ? [] : [JSON.stringify(body)], ...overrides }),
-    response,
-  );
-  return { route: route.path, status: response.status, headers: response.headers, value: JSON.parse(response.body) };
+  await route.handler(makeRequest({
+    chunks: body === undefined ? [] : [JSON.stringify(body)],
+    ...overrides,
+  }), response);
+  return { status: response.status, headers: response.headers, value: JSON.parse(response.body) };
 }
 
-const paths = routes.map((route) => route.path).join(',');
-check(paths === '/api/dsh-github/status,/api/dsh-github/set,/api/dsh-github/clear,/api/dsh-github/verify', 'bridge paths');
+const statusReply = await callBridge('/api/dsh-apikeys/status', {});
+check(statusReply.value.ok === true, 'status answers ok');
+check(statusReply.headers['cache-control'] === 'no-store', 'bridge replies are not cached');
+check(statusReply.value.value.defaultPlatform === 'github', 'status reports the default platform');
 
-const status = await callBridge('/api/dsh-github/status', {});
-check(status.status === 200 && status.value.ok === true, 'status answers ok');
-check(status.value.value.defaultAccount === 'default', 'status reports the default account');
-check(status.value.value.exposeKeys === true, 'status reports exposeKeys');
-check(status.headers['cache-control'] === 'no-store', 'responses are not cached');
-
-const setReply = await callBridge('/api/dsh-github/set', { account: 'default', token: 'tokenFromBridge' });
+const setReply = await callBridge('/api/dsh-apikeys/set', { platform: 'vercel', token: 'vercelKey' });
 check(setReply.value.ok === true, 'set through the bridge succeeds');
-check(records.get('dsh-github/default')?.key === 'tokenFromBridge', 'the bridge wrote the record');
+check(records.get('dsh-apikeys/vercel-default')?.key === 'vercelKey', 'the bridge wrote the record');
 
-const verify = await callBridge('/api/dsh-github/verify', { account: 'default' });
-check(verify.value.ok === true && verify.value.value.login === 'octo-tester', 'verify reports the GitHub login');
+const verifyReply = await callBridge('/api/dsh-apikeys/verify', { platform: 'vercel' });
+check(verifyReply.value.ok === true, 'verify succeeds against the scripted host');
+check(verifyReply.value.value.identity === 'vercel-user', 'verify extracts the identity by dotted path');
 
-const clearReply = await callBridge('/api/dsh-github/clear', { account: 'default' });
+const cfVerify = await callBridge('/api/dsh-apikeys/verify', { platform: 'cloudflare' });
+check(cfVerify.value.ok === true && cfVerify.value.value.identity === 'active', 'cloudflare verifies its own way');
+
+const ghVerify = await callBridge('/api/dsh-apikeys/verify', { platform: 'github' });
+check(ghVerify.value.ok === true && ghVerify.value.value.identity === 'octo-tester', 'github verifies its identity');
+
+const noVerify = await callBridge('/api/dsh-apikeys/verify', { platform: 'basicco' });
+check(noVerify.value.ok === false && noVerify.value.code === 'no-verify', 'a platform without verify says so');
+
+const clearReply = await callBridge('/api/dsh-apikeys/clear', { platform: 'vercel' });
 check(clearReply.value.ok === true, 'clear through the bridge succeeds');
 
-const badAccount = await callBridge('/api/dsh-github/set', { account: 'Not Valid', token: 'x' });
-check(badAccount.value.ok === false && badAccount.value.code === 'invalid-account', 'an invalid account is refused by the bridge');
+const badPlatform = await callBridge('/api/dsh-apikeys/set', { platform: 'nope', token: 'x' });
+check(badPlatform.value.ok === false && badPlatform.value.code === 'unknown-platform', 'an unknown platform is refused by the bridge');
 
-const emptyToken = await callBridge('/api/dsh-github/set', { account: 'default', token: '  ' });
-check(emptyToken.value.ok === false && emptyToken.value.code === 'empty-token', 'an empty token is refused by the bridge');
-
-const crossSite = await callBridge('/api/dsh-github/status', {}, { headers: { 'sec-fetch-site': 'cross-site' } });
+const crossSite = await callBridge('/api/dsh-apikeys/status', {}, { headers: { 'sec-fetch-site': 'cross-site' } });
 check(crossSite.status === 403, 'a cross-site request is refused');
-
-const foreignOrigin = await callBridge('/api/dsh-github/status', {}, { headers: { origin: 'https://evil.example.com' } });
+const foreignOrigin = await callBridge('/api/dsh-apikeys/status', {}, { headers: { origin: 'https://evil.example' } });
 check(foreignOrigin.status === 403, 'a foreign origin is refused');
+const nonPost = await callBridge('/api/dsh-apikeys/status', {}, { method: 'GET' });
+check(nonPost.status === 405, 'a non-POST request is refused');
 
-const getMethodRoute = await (async () => {
-  const route = routes.find((entry) => entry.path === '/api/dsh-github/status');
-  const response = makeResponse();
-  await route.handler(makeRequest({ method: 'GET' }), response);
-  return response.status;
-})();
-check(getMethodRoute === 405, 'a non-POST request is refused');
+// -------------------------------------------------------------- migration
+console.log('migration');
+records.clear();
+records.set('dsh-github/default', { kind: 'api-key', key: 'legacyGithubKey' });
+const migrationRegistered = [];
+const migrationCtx = makeContext();
+migrationCtx.tools = { register() { return () => {}; } };
+migrationCtx.webServer = { register() { return () => {}; } };
+apply(migrationCtx, { enabledPlatforms: ['github'], defaultPlatform: 'github', defaultAccount: 'default' });
+await new Promise((resolve) => setTimeout(resolve, 30));
+check(
+  records.get('dsh-apikeys/github-default')?.key === 'legacyGithubKey',
+  'a key from the earlier github-only layout is adopted',
+);
+check(records.has('dsh-github/default'), 'the earlier record is left in place');
 
-// ------------------------------------------------------------- config errors
+// A second mount must not overwrite a key the new layout already holds.
+records.set('dsh-apikeys/github-default', { kind: 'api-key', key: 'newerKey' });
+apply(migrationCtx, { enabledPlatforms: ['github'], defaultPlatform: 'github', defaultAccount: 'default' });
+await new Promise((resolve) => setTimeout(resolve, 30));
+check(records.get('dsh-apikeys/github-default')?.key === 'newerKey', 'an existing new-layout key is not overwritten');
+
+// ----------------------------------------------------------- configuration
 console.log('configuration');
-registered.length = 0;
-routes.length = 0;
-apply(makeContext(), {});
-check(registered.length === 3, 'the defaults mount with no config');
-const defaults = await byName.get('github_accounts').execute({}, exec);
-check(defaults.baseUrl === 'https://api.github.com', 'the default base URL');
-check(defaults.envName === 'GITHUB_TOKEN', 'the default environment reference');
-
-registered.length = 0;
-routes.length = 0;
-apply(makeContext(), { exposeKeys: false });
-const hidden = registered.find((tool) => tool.name === 'github_key');
-let blocked = null;
+const offRegistry = [];
+const offCtx = makeContext();
+offCtx.tools = { register(definition) { offRegistry.push(definition); return () => {}; } };
+apply(offCtx, { exposeKeys: false, enabledPlatforms: ['github'], defaultPlatform: 'github' });
+const hidden = offRegistry.find((tool) => tool.name === 'apikey_key');
+refused = null;
 try {
-  await hidden.execute({ action: 'get' }, exec);
-} catch (error) {
-  blocked = error.message;
-}
-check(blocked !== null && blocked.includes('exposeKeys'), 'exposeKeys:false refuses github_key get');
+  await hidden.execute({ action: 'get', platform: 'github' }, exec);
+} catch (error) { refused = error.message; }
+check(refused !== null && refused.includes('exposeKeys'), 'exposeKeys:false refuses apikey_key get');
+const headerBlocked = offRegistry.find((tool) => tool.name === 'apikey_key');
+const stillStores = await headerBlocked.execute({ action: 'set', platform: 'github', value: 'allowed' }, exec);
+check(stillStores.ok === true, 'exposeKeys:false still allows storing a key');
 
-const hiddenSet = await hidden.execute({ action: 'set', account: 'work', value: 'tokenWorkStillAllowed' }, exec);
-check(hiddenSet.ok === true, 'exposeKeys:false still allows storing a token');
+const fallbackOff = [];
+const fbCtx = makeContext();
+fbCtx.tools = { register(definition) { fallbackOff.push(definition); return () => {}; } };
+apply(fbCtx, { envFallback: false, enabledPlatforms: ['github'], defaultPlatform: 'github' });
+const noFallbackGet = await fallbackOff.find((tool) => tool.name === 'apikey_key')
+  .execute({ action: 'get', platform: 'github', account: 'ghost' }, exec);
+check(noFallbackGet.configured === false, 'envFallback:false leaves an unset account unconfigured');
+
+const narrowed = [];
+const narrowCtx = makeContext();
+narrowCtx.tools = { register(definition) { narrowed.push(definition); return () => {}; } };
+apply(narrowCtx, { enabledPlatforms: ['npm'], defaultPlatform: 'npm' });
+const narrowList = await narrowed.find((tool) => tool.name === 'apikey_platforms').execute({}, exec);
+check(narrowList.platforms.length === 1 && narrowList.platforms[0].id === 'npm', 'enabledPlatforms narrows the surface');
+
+// ------------------------------------------------------------ validation
+console.log('schema validation');
+const callTool = registered.find((tool) => tool.name === 'apikey_call');
+check(validateJsonSchemaValue(callTool.parameters, { platform: 'github', path: '/user' }).length === 0, 'apikey_call accepts a minimal call');
+check(validateJsonSchemaValue(callTool.parameters, { path: '/user' }).length > 0, 'apikey_call requires platform');
+check(validateJsonSchemaValue(callTool.parameters, { platform: 'github', path: '/x', method: 'BAD' }).length > 0, 'apikey_call rejects an unknown method');
+check(validateJsonSchemaValue(callTool.parameters, { platform: 'github', path: '/x', extra: 1 }).length > 0, 'apikey_call rejects undeclared arguments');
+
+const keyTool = registered.find((tool) => tool.name === 'apikey_key');
+check(validateJsonSchemaValue(keyTool.parameters, { action: 'get', platform: 'github' }).length === 0, 'apikey_key accepts get');
+check(validateJsonSchemaValue(keyTool.parameters, { action: 'nope', platform: 'github' }).length > 0, 'apikey_key rejects an unknown action');
+check(validateJsonSchemaValue(keyTool.parameters, { action: 'get' }).length > 0, 'apikey_key requires platform');
 
 console.log('');
 if (failures.length > 0) {

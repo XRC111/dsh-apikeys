@@ -1,6 +1,6 @@
 {
   "meta": {
-    "title": "GitHub",
-    "description": "Stores GitHub API tokens and gives the model github_api, github_accounts and github_key so it can call the GitHub REST API as you."
+    "title": "API Keys",
+    "description": "Stores API keys for GitHub, Cloudflare, Vercel, npm, Docker Hub, Hugging Face and your own platforms, and gives the model apikey_call, apikey_platforms and apikey_key so it can call their APIs as you."
   }
 }

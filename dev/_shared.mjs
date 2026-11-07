@@ -3,8 +3,8 @@
  *
  * Every script must work from a fresh clone, so nothing here hardcodes a
  * machine path: the plugin is located relative to this file, and the DSH
- * runtime is found through `DSH_RUNTIME_DIR`, this process's own resolution,
- * or the profile node_modules under `DSH_HOME`.
+ * runtime is found through `DSH_TOOLS_PATH`, `DSH_RUNTIME_DIR`, or the profile
+ * node_modules under `DSH_HOME`.
  */
 import { createRequire } from 'node:module';
 import path from 'node:path';
@@ -29,8 +29,6 @@ function searchRoots() {
   const explicit = process.env.DSH_RUNTIME_DIR;
   if (explicit) roots.push(path.join(explicit, 'node_modules'));
 
-  // A profile's node_modules holds whatever profile-installed bundles need,
-  // and `@deepseek-ai/dsh-tools` there is the copy the Harness resolves.
   const home = process.env.DSH_HOME;
   if (home) {
     const profiles = path.join(home, 'profiles');
@@ -51,7 +49,6 @@ function searchRoots() {
  * script that quietly checks nothing is worse than one that refuses to run.
  */
 export function resolveDshTools() {
-  // A direct path wins: the caller knows exactly where the module is.
   const direct = process.env.DSH_TOOLS_PATH;
   if (direct) {
     if (!fs.existsSync(direct)) {
@@ -61,7 +58,6 @@ export function resolveDshTools() {
   }
 
   const requireFromHere = createRequire(import.meta.url);
-
   for (const base of searchRoots()) {
     try {
       return requireFromHere.resolve('@deepseek-ai/dsh-tools', { paths: [base] });
@@ -69,7 +65,6 @@ export function resolveDshTools() {
       // try the next candidate
     }
   }
-
   try {
     return requireFromHere.resolve('@deepseek-ai/dsh-tools');
   } catch {
@@ -80,18 +75,11 @@ export function resolveDshTools() {
     'cannot locate @deepseek-ai/dsh-tools, so the runtime validators are unavailable.\n'
     + 'These checks run against an installed DeepSeek Harness. Point at your installation either way:\n'
     + '  DSH_TOOLS_PATH=/path/to/node_modules/@deepseek-ai/dsh-tools/lib/index.js\n'
-    + '  DSH_RUNTIME_DIR=/path/to/dsh-runtime\n'
-    + 'The Desktop app keeps its runtime under the app resources directory, for example\n'
-    + '  <install>/resources/dsh-runtime/node_modules',
+    + '  DSH_RUNTIME_DIR=/path/to/dsh-runtime',
   );
 }
 
 /** Import the runtime's tool validators. */
 export async function importDshTools() {
   return import(pathToFileURL(resolveDshTools()).href);
-}
-
-/** Whether one file exists. */
-export function exists(file) {
-  return fs.existsSync(file);
 }

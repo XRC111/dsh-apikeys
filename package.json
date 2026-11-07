@@ -1,7 +1,7 @@
 {
-  "name": "dsh-github-plugin",
+  "name": "dsh-apikeys-plugin",
   "version": "1.0.0",
-  "description": "GitHub API tokens for DeepSeek Harness: a credential store for named accounts plus github_api / github_accounts / github_key tools so the model can call the GitHub REST API with the user's own token.",
+  "description": "Multi-platform API keys for DeepSeek Harness: stores keys for GitHub, Cloudflare, Vercel, npm, Docker Hub, Hugging Face and your own custom platforms in the DSH credential store, and exposes apikey_call / apikey_platforms / apikey_key so the model can call their APIs with your identity.",
   "type": "module",
   "exports": {
     ".": "./index.js",
@@ -22,11 +22,15 @@
     "deepseek-harness",
     "dsh",
     "dsh-plugin",
-    "github",
-    "github-api",
-    "api-key",
+    "api-keys",
     "credentials",
-    "personal-access-token"
+    "github",
+    "cloudflare",
+    "vercel",
+    "npm",
+    "dockerhub",
+    "huggingface",
+    "secret-management"
   ],
   "license": "MIT",
   "author": "XRC111",

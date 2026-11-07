@@ -1,6 +1,6 @@
 {
   "meta": {
-    "title": "GitHub",
-    "description": "存放 GitHub API Token，并向模型提供 github_api、github_accounts、github_key 三个工具，让它能以你的身份调用 GitHub。"
+    "title": "API Keys",
+    "description": "统一存放 GitHub、Cloudflare、Vercel、npm、Docker Hub、Hugging Face 以及自定义平台的 API Key，并向模型提供 apikey_call、apikey_platforms、apikey_key，让它能以你的身份调用这些 API。"
   }
 }

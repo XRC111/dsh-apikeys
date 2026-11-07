@@ -30,7 +30,7 @@ jobs:
           const fs = require('node:fs');
           const pkg = JSON.parse(fs.readFileSync('package.json', 'utf8'));
           const assert = (ok, message) => { if (!ok) { console.error(message); process.exit(1); } };
-          assert(pkg.name === 'dsh-github-plugin', 'unexpected package name');
+          assert(pkg.name === 'dsh-apikeys-plugin', 'unexpected package name');
           assert(pkg.type === 'module', 'package must be an ES module');
           assert(pkg.dsh.bundle.patch, 'dsh.bundle.patch is required');
           assert(pkg.dsh.client.platform === 'web', 'dsh.client.platform must be web');
@@ -66,6 +66,9 @@ jobs:
           console.log('icon ok,', Buffer.byteLength(svg), 'bytes');
           "
 
+      - name: Client half checks
+        run: node dev/client-smoke.mjs
+
       - name: Scan for committed secrets
         run: |
           node -e "
@@ -74,6 +77,7 @@ jobs:
           const patterns = [
             [/gh[pousr]_[A-Za-z0-9]{20,}/, 'GitHub token'],
             [/github_pat_[A-Za-z0-9_]{20,}/, 'GitHub fine-grained token'],
+            [/npm_[A-Za-z0-9]{30,}/, 'npm token'],
             [/sk-[A-Za-z0-9]{20,}/, 'API key'],
           ];
           const skip = new Set(['node_modules', '.git']);

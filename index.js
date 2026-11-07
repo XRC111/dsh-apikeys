@@ -1,30 +1,111 @@
 /**
- * Host half of `dsh-github-plugin`.
+ * Host half of `dsh-apikeys-plugin`.
  *
- * It owns three things and nothing else:
+ * One credential store for many API platforms, and the tools that let the
+ * model use those credentials without ever holding them.
  *
- * 1. A named token store on top of the Host `credentials` service. Tokens are
- *    kept as `dsh-github/<account>` credential *records*, so they never enter
- *    configuration, the session log, or a tool result unless the user asks.
- *    When a name has no record, the default account may fall back to the
- *    `GITHUB_TOKEN` reference (environment / `.env`), which the credentials
- *    service already layers for every other key.
- * 2. The model-facing tools `github_api`, `github_accounts` and `github_key`.
- * 3. The same-origin bridge under `/api/dsh-github` that the Client page calls
- *    to list, store, verify and remove tokens.
+ * 1. Keys live in the Host credential store as `dsh-apikeys/<platform>-<account>`
+ *    records, so they never enter configuration, the session log, or a tool
+ *    result unless the user explicitly asks.
+ * 2. Each account is bound to one platform. A platform fixes the API host and
+ *    the shape of its auth header, so a key can only ever be sent where that
+ *    platform's API lives — `apikey_call` takes a path, never a URL.
+ * 3. A same-origin bridge under `/api/dsh-apikeys` backs the settings page.
  *
  * The module imports nothing. Every collaborator is a Cordis service resolved
- * through the context (`tools`, `webServer`, `credentials`, `webStartup`), so
- * the bundle keeps loading across Harness versions that keep those seams.
+ * through the context, so the bundle keeps loading across Harness versions
+ * that keep those seams.
  */
 
-const CREDENTIAL_SCOPE = 'dsh-github';
-const BRIDGE_PREFIX = '/api/dsh-github';
-const ACCOUNT_PATTERN = /^[a-z][a-z0-9-]*$/;
+const CREDENTIAL_SCOPE = 'dsh-apikeys';
+const BRIDGE_PREFIX = '/api/dsh-apikeys';
+/** Platform ids and account names are one lowercase alphanumeric word each. */
+const NAME_PATTERN = /^[a-z][a-z0-9]*$/;
+/** Longer names are a mistake, not an intent, and bloat every credential key. */
+const MAX_NAME_LENGTH = 32;
 const ENV_NAME_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/;
 const DEFAULT_ACCOUNT = 'default';
 const METHODS = ['GET', 'POST', 'PATCH', 'PUT', 'DELETE', 'HEAD'];
 const MAX_REQUEST_BYTES = 64 * 1024;
+
+/**
+ * Built-in platforms: where the API lives, how a key is presented, and how to
+ * prove a key works.
+ *
+ * `verify` points at an endpoint that answers 200 only for a valid token and
+ * names an identity field published in its response, so "it saved" and "it
+ * works" stay different facts.
+ */
+const BUILTIN_PLATFORMS = {
+  github: {
+    label: 'GitHub',
+    baseUrl: 'https://api.github.com',
+    envName: 'GITHUB_TOKEN',
+    auth: { kind: 'bearer' },
+    docs: 'https://github.com/settings/tokens',
+    hint: 'Classic token: `repo` for private repositories. Fine-grained: pick the repositories and permissions you need.',
+    verify: { path: '/user', identity: 'login' },
+    headers: { accept: 'application/vnd.github+json', 'x-github-api-version': '2022-11-28' },
+    note: 'Token is never sent anywhere but the configured host.',
+  },
+  cloudflare: {
+    label: 'Cloudflare',
+    baseUrl: 'https://api.cloudflare.com/client/v4',
+    envName: 'CLOUDFLARE_API_TOKEN',
+    auth: { kind: 'bearer' },
+    docs: 'https://dash.cloudflare.com/profile/api-tokens',
+    hint: 'Create an API Token (not the Global API Key). Scope it to the zones and permissions you want.',
+    verify: { path: '/user/tokens/verify', identity: 'result.status' },
+    headers: { accept: 'application/json' },
+    note: 'Only API Tokens work here; the legacy Global API Key uses a different header.',
+  },
+  vercel: {
+    label: 'Vercel',
+    baseUrl: 'https://api.vercel.com',
+    envName: 'VERCEL_TOKEN',
+    auth: { kind: 'bearer' },
+    docs: 'https://vercel.com/account/tokens',
+    hint: 'Account Settings → Tokens → Create. Set a scope and an expiry.',
+    verify: { path: '/v2/user', identity: 'user.username' },
+    headers: { accept: 'application/json' },
+    note: 'A team-scoped token may need a slug or teamId query parameter for team resources.',
+  },
+  npm: {
+    label: 'npm',
+    baseUrl: 'https://registry.npmjs.org',
+    envName: 'NPM_TOKEN',
+    auth: { kind: 'bearer' },
+    docs: 'https://www.npmjs.com/settings/~/tokens',
+    hint: 'Automation tokens publish without a 2FA prompt; granular tokens must enable "bypass 2FA" to publish.',
+    verify: { path: '/-/whoami', identity: 'username' },
+    headers: { accept: 'application/json' },
+    note: 'Publishing uses PUT on the package path; this plugin never does that on its own.',
+  },
+  dockerhub: {
+    label: 'Docker Hub',
+    baseUrl: 'https://hub.docker.com/v2',
+    envName: 'DOCKERHUB_TOKEN',
+    auth: { kind: 'bearer' },
+    docs: 'https://hub.docker.com/settings/security',
+    hint: 'Account Settings → Security → New Access Token. Use the token, not your password.',
+    verify: { path: '/user', identity: 'username' },
+    headers: { accept: 'application/json' },
+    note: 'Personal access tokens are read/write or read-only; pick the narrow one.',
+  },
+  huggingface: {
+    label: 'Hugging Face',
+    baseUrl: 'https://huggingface.co/api',
+    envName: 'HF_TOKEN',
+    auth: { kind: 'bearer' },
+    docs: 'https://huggingface.co/settings/tokens',
+    hint: 'Settings → Access Tokens → New token. "Read" is enough for downloads; "Write" for uploads.',
+    verify: { path: '/whoami-v2', identity: 'name' },
+    headers: { accept: 'application/json' },
+    note: 'A fine-grained token only sees the repositories you scoped it to.',
+  },
+};
+
+const AUTH_KINDS = ['bearer', 'header', 'x-api-key', 'basic', 'query'];
 
 /** Treat anything that is not a plain object as an empty one. */
 function asObject(value) {
@@ -42,11 +123,32 @@ function clamp(value, min, max) {
   return Math.min(Math.max(value, min), max);
 }
 
-/** Lowercase account names are the only thing `credentialKey` accepts. */
-function normalizeAccount(raw) {
+/**
+ * Normalize a name that is allowed to be written loosely.
+ *
+ * Configuration is hand-written, so `defaultPlatform: GitHub` should work. The
+ * value is lowercased first and only has to satisfy the grammar afterwards.
+ */
+function normalizeLooseName(raw) {
   if (typeof raw !== 'string') return undefined;
   const name = raw.trim().toLowerCase();
-  return ACCOUNT_PATTERN.test(name) ? name : undefined;
+  if (name.length === 0 || name.length > MAX_NAME_LENGTH) return undefined;
+  return NAME_PATTERN.test(name) ? name : undefined;
+}
+
+/**
+ * Normalize an account name, which must already be lowercase.
+ *
+ * Account names address credential records, so a caller that types `Work`
+ * would silently store `work` and then fail to find it by the name it used.
+ * Rejecting the mixed-case form is the honest answer: the caller learns the
+ * rule instead of getting a record under a name it did not ask for.
+ */
+function normalizeAccountName(raw) {
+  if (typeof raw !== 'string') return undefined;
+  const name = raw.trim();
+  if (name.length === 0 || name.length > MAX_NAME_LENGTH) return undefined;
+  return NAME_PATTERN.test(name) ? name : undefined;
 }
 
 /** Resolve one HTTP method; `undefined` means the caller named an unknown one. */
@@ -59,98 +161,200 @@ function normalizeMethod(raw) {
 /** Read the row configuration with defaults and no schema dependency. */
 function readConfig(raw) {
   const config = asObject(raw);
-  const trimmed = typeof config.baseUrl === 'string' ? config.baseUrl.trim() : '';
   return {
-    baseUrl: (trimmed.length > 0 ? trimmed : 'https://api.github.com').replace(/\/+$/u, ''),
-    defaultAccount: normalizeAccount(config.defaultAccount) ?? DEFAULT_ACCOUNT,
+    defaultPlatform: normalizeLooseName(config.defaultPlatform) ?? 'github',
+    defaultAccount: normalizeLooseName(config.defaultAccount) ?? DEFAULT_ACCOUNT,
+    enabledPlatforms: Array.isArray(config.enabledPlatforms)
+      ? config.enabledPlatforms.map((entry) => String(entry).trim().toLowerCase()).filter(Boolean)
+      : Object.keys(BUILTIN_PLATFORMS),
+    customPlatforms: Array.isArray(config.customPlatforms) ? config.customPlatforms : [],
     exposeKeys: config.exposeKeys !== false,
     envFallback: config.envFallback !== false,
-    envName: typeof config.envName === 'string' && ENV_NAME_PATTERN.test(config.envName.trim())
-      ? config.envName.trim()
-      : 'GITHUB_TOKEN',
     maxResponseChars: clamp(toInteger(config.maxResponseChars, 20000), 2000, 400000),
     requestTimeoutMs: clamp(toInteger(config.requestTimeoutMs, 30000), 1000, 180000),
-    apiVersion: typeof config.apiVersion === 'string' && config.apiVersion.trim().length > 0
-      ? config.apiVersion.trim()
-      : '2022-11-28',
     userAgent: typeof config.userAgent === 'string' && config.userAgent.trim().length > 0
       ? config.userAgent.trim()
-      : 'dsh-github',
+      : 'dsh-apikeys',
+    migrateGitHub: config.migrateGitHub !== false,
+  };
+}
+
+/** Normalize one custom platform row, or `undefined` when it cannot be used. */
+function normalizeCustomPlatform(raw) {
+  const entry = asObject(raw);
+  const id = normalizeLooseName(entry.id);
+  if (id === undefined) return undefined;
+  const baseUrl = typeof entry.baseUrl === 'string' ? entry.baseUrl.trim() : '';
+  if (!/^https?:\/\//u.test(baseUrl)) return undefined;
+
+  const auth = asObject(entry.auth);
+  const kind = AUTH_KINDS.includes(auth.kind) ? auth.kind : 'bearer';
+  const headerName = typeof auth.header === 'string' && auth.header.trim().length > 0
+    ? auth.header.trim().toLowerCase()
+    : undefined;
+  if ((kind === 'header' || kind === 'x-api-key') && headerName === undefined) return undefined;
+
+  const verify = asObject(entry.verify);
+  return {
+    label: typeof entry.label === 'string' && entry.label.trim().length > 0 ? entry.label.trim() : id,
+    baseUrl: baseUrl.replace(/\/+$/u, ''),
+    envName: typeof entry.envName === 'string' && ENV_NAME_PATTERN.test(entry.envName.trim())
+      ? entry.envName.trim()
+      : undefined,
+    auth: {
+      kind,
+      ...(headerName === undefined ? {} : { header: headerName }),
+      ...(typeof auth.scheme === 'string' && auth.scheme.trim().length > 0 ? { scheme: auth.scheme.trim() } : {}),
+      ...(typeof auth.username === 'string' ? { username: auth.username } : {}),
+      ...(typeof auth.queryParam === 'string' && auth.queryParam.trim().length > 0
+        ? { queryParam: auth.queryParam.trim() }
+        : {}),
+    },
+    docs: typeof entry.docs === 'string' ? entry.docs : undefined,
+    hint: typeof entry.hint === 'string' ? entry.hint : undefined,
+    note: typeof entry.note === 'string' ? entry.note : undefined,
+    verify: typeof verify.path === 'string' && verify.path.startsWith('/')
+      ? { path: verify.path, identity: typeof verify.identity === 'string' ? verify.identity : undefined }
+      : undefined,
+    headers: asObject(entry.headers),
+    custom: true,
   };
 }
 
 /**
- * Resolve the token behind one account name.
- *
- * A stored record always wins; the environment reference is consulted only for
- * the default account and only while `envFallback` is on, so a named account
- * can never silently inherit somebody else's token.
- *
- * @returns `{ token, source }`; `token` is `undefined` while unconfigured.
+ * Every platform this plugin can serve: enabled built-ins plus usable custom rows.
+ * @returns a map keyed by platform id.
  */
-async function accountToken(ctx, config, account) {
-  const credentials = ctx.get('credentials');
-  if (credentials === undefined) return { token: undefined, source: 'unavailable' };
+function resolvePlatforms(config) {
+  const platforms = new Map();
+  for (const id of config.enabledPlatforms) {
+    const builtin = BUILTIN_PLATFORMS[id];
+    if (builtin !== undefined) platforms.set(id, { id, ...builtin, custom: false });
+  }
+  for (const raw of config.customPlatforms) {
+    const custom = normalizeCustomPlatform(raw);
+    if (custom !== undefined) {
+      const customId = normalizeLooseName(raw.id);
+      platforms.set(customId, { id: customId, ...custom });
+    }
+  }
+  return platforms;
+}
 
-  const record = await credentials.readRecord(`${CREDENTIAL_SCOPE}/${account}`);
+/** The credential record id for one account: `<platform>-<account>`. */
+function recordId(platform, account) {
+  return `${platform}-${account}`;
+}
+
+/** Build the auth (and static) headers for one key. */
+function authHeaders(platform, key) {
+  const headers = { ...(platform.headers ?? {}) };
+  const auth = platform.auth ?? { kind: 'bearer' };
+  const scheme = auth.scheme ?? 'Bearer';
+
+  switch (auth.kind) {
+    case 'bearer':
+      headers.authorization = `${scheme} ${key}`;
+      break;
+    case 'header':
+      headers[auth.header] = key;
+      break;
+    case 'x-api-key':
+      headers[auth.header] = key;
+      if (scheme !== '') headers.authorization = undefined;
+      if (headers.authorization === undefined) delete headers.authorization;
+      break;
+    case 'basic': {
+      const user = typeof auth.username === 'string' ? auth.username : '';
+      headers.authorization = `Basic ${Buffer.from(`${user}:${key}`, 'utf8').toString('base64')}`;
+      break;
+    }
+    case 'query':
+      break;
+    default:
+      headers.authorization = `${scheme} ${key}`;
+  }
+  return headers;
+}
+
+/** Place key material in the query string for the `query` auth kind. */
+function applyQueryAuth(platform, url, key) {
+  const auth = platform.auth ?? { kind: 'bearer' };
+  if (auth.kind !== 'query') return;
+  url.searchParams.set(auth.queryParam ?? 'api_key', key);
+}
+
+/**
+ * Resolve the key behind one account.
+ *
+ * A stored record always wins. Only the platform's default account may fall
+ * back to the platform's environment reference, so a named account can never
+ * silently inherit somebody else's credential.
+ * @returns `{ key, source }`; `key` is `undefined` while unconfigured.
+ */
+async function accountKey(ctx, config, platform, account) {
+  const credentials = ctx.get('credentials');
+  if (credentials === undefined) return { key: undefined, source: 'unavailable' };
+
+  const record = await credentials.readRecord(`${CREDENTIAL_SCOPE}/${recordId(platform.id, account)}`);
   if (record !== undefined && record !== null
     && record.kind === 'api-key'
     && typeof record.key === 'string' && record.key.length > 0) {
-    return { token: record.key, source: 'stored' };
+    return { key: record.key, source: 'stored' };
   }
 
-  if (account === config.defaultAccount && config.envFallback) {
-    const hit = await credentials.resolve(config.envName);
+  if (account === config.defaultAccount && config.envFallback && platform.envName !== undefined) {
+    const hit = await credentials.resolve(platform.envName);
     if (hit !== undefined && hit !== null && typeof hit.value === 'string' && hit.value.length > 0) {
-      return { token: hit.value, source: hit.source || config.envName };
+      return { key: hit.value, source: hit.source || platform.envName };
     }
   }
 
-  return { token: undefined, source: 'unset' };
+  return { key: undefined, source: 'unset' };
 }
 
-/** Store or replace one account token. */
-async function storeToken(ctx, config, account, token) {
+/** Store or replace one account key. */
+async function storeKey(ctx, platform, account, key) {
   const credentials = ctx.get('credentials');
   if (credentials === undefined) {
-    throw new Error('this profile has no credentials service, so GitHub tokens cannot be stored here');
+    throw new Error('this profile has no credentials service, so keys cannot be stored here');
   }
-  const key = `${CREDENTIAL_SCOPE}/${account}`;
-  await credentials.modifyRecord(key, async () => ({ kind: 'api-key', key: token }));
-  return { token, source: 'stored' };
+  await credentials.modifyRecord(
+    `${CREDENTIAL_SCOPE}/${recordId(platform.id, account)}`,
+    async () => ({ kind: 'api-key', key }),
+  );
 }
 
-/** Remove one stored account token. Removing an absent record is a no-op. */
-async function removeToken(ctx, account) {
+/** Remove one stored account key. Removing an absent record is a no-op. */
+async function removeKey(ctx, platform, account) {
   const credentials = ctx.get('credentials');
   if (credentials === undefined) {
     throw new Error('this profile has no credentials service, so there is nothing to remove');
   }
-  await credentials.deleteRecord(`${CREDENTIAL_SCOPE}/${account}`);
+  await credentials.deleteRecord(`${CREDENTIAL_SCOPE}/${recordId(platform.id, account)}`);
 }
 
-/** Every account this plugin knows about, with its configured state and no values. */
-async function listAccounts(ctx, config) {
+/** Every account stored for one platform, with state and no values. */
+async function listAccounts(ctx, config, platform) {
   const credentials = ctx.get('credentials');
   const names = new Set([config.defaultAccount]);
+  const prefix = `${CREDENTIAL_SCOPE}/${platform.id}-`;
 
   if (credentials !== undefined) {
     for (const entry of await credentials.listRecords()) {
       const key = String(entry?.key ?? '');
-      const slash = key.indexOf('/');
-      if (slash < 0) continue;
-      if (key.slice(0, slash) !== CREDENTIAL_SCOPE) continue;
-      const name = key.slice(slash + 1);
-      if (ACCOUNT_PATTERN.test(name)) names.add(name);
+      if (!key.startsWith(prefix)) continue;
+      const name = key.slice(prefix.length);
+      if (NAME_PATTERN.test(name)) names.add(name);
     }
   }
 
   const accounts = [];
   for (const name of [...names].sort((left, right) => left.localeCompare(right))) {
-    const credential = await accountToken(ctx, config, name);
+    const credential = await accountKey(ctx, config, platform, name);
     accounts.push({
       name,
-      configured: credential.token !== undefined,
+      configured: credential.key !== undefined,
       source: credential.source,
       isDefault: name === config.defaultAccount,
     });
@@ -158,53 +362,15 @@ async function listAccounts(ctx, config) {
   return accounts;
 }
 
-/** Parse `Link: <...>; rel="next"` into page numbers. */
-function parseLinkPages(header) {
-  if (typeof header !== 'string' || header.length === 0) return undefined;
-  const pages = {};
-  for (const part of header.split(',')) {
-    const match = /<([^>]+)>\s*;\s*rel="([^"]+)"/u.exec(part.trim());
-    if (match === null) continue;
-    let page;
-    try {
-      const raw = new URL(match[1], 'https://api.github.com').searchParams.get('page');
-      page = raw === null ? undefined : toInteger(raw, undefined);
-    } catch {
-      page = undefined;
-    }
-    if (page === undefined) continue;
-    if (match[2] === 'next') pages.next = page;
-    if (match[2] === 'last') pages.last = page;
+/** Read one dotted path out of a JSON body, for identity extraction. */
+function readPath(value, dotted) {
+  if (typeof dotted !== 'string' || dotted.length === 0) return undefined;
+  let cursor = value;
+  for (const segment of dotted.split('.')) {
+    if (cursor === null || typeof cursor !== 'object') return undefined;
+    cursor = cursor[segment];
   }
-  return pages.next === undefined && pages.last === undefined ? undefined : pages;
-}
-
-/** Rate-limit headers, when the response carries them. */
-function readRateLimit(headers) {
-  const limit = toInteger(headers.get('x-ratelimit-limit'), undefined);
-  const remaining = toInteger(headers.get('x-ratelimit-remaining'), undefined);
-  if (limit === undefined && remaining === undefined) return undefined;
-  const used = toInteger(headers.get('x-ratelimit-used'), undefined);
-  const reset = toInteger(headers.get('x-ratelimit-reset'), undefined);
-  const resource = headers.get('x-ratelimit-resource');
-  return {
-    ...(limit === undefined ? {} : { limit }),
-    ...(remaining === undefined ? {} : { remaining }),
-    ...(used === undefined ? {} : { used }),
-    ...(reset === undefined ? {} : { reset }),
-    ...(typeof resource === 'string' && resource.length > 0 ? { resource } : {}),
-  };
-}
-
-/** One line of guidance for a failed request, when a status suggests one. */
-function hintFor(status, remaining) {
-  if (status === 401) return 'the token is missing, expired, or revoked; check the account in github_accounts and store a new one';
-  if (status === 403 && remaining === 0) return 'the API rate limit is exhausted; wait until reset or use a different account';
-  if (status === 403) return 'the token lacks permission for this resource, or a GitHub policy blocked the request';
-  if (status === 404) return 'the resource does not exist, or this token cannot see it (GitHub hides private resources as 404)';
-  if (status === 422) return 'GitHub rejected the request body or query; read the returned errors';
-  if (status === 429) return 'too many requests; back off before retrying';
-  return undefined;
+  return typeof cursor === 'string' || typeof cursor === 'number' ? String(cursor) : undefined;
 }
 
 /** Compose the caller signal with a request timeout. */
@@ -227,19 +393,70 @@ function requestSignal(timeoutMs, signal) {
   };
 }
 
+/** Parse `Link: <...>; rel="next"` into page numbers. */
+function parseLinkPages(header) {
+  if (typeof header !== 'string' || header.length === 0) return undefined;
+  const pages = {};
+  for (const part of header.split(',')) {
+    const match = /<([^>]+)>\s*;\s*rel="([^"]+)"/u.exec(part.trim());
+    if (match === null) continue;
+    let page;
+    try {
+      const raw = new URL(match[1], 'https://example.invalid').searchParams.get('page');
+      page = raw === null ? undefined : toInteger(raw, undefined);
+    } catch {
+      page = undefined;
+    }
+    if (page === undefined) continue;
+    if (match[2] === 'next') pages.next = page;
+    if (match[2] === 'last') pages.last = page;
+  }
+  return pages.next === undefined && pages.last === undefined ? undefined : pages;
+}
+
+/** Rate-limit headers, when the response carries them. */
+function readRateLimit(headers) {
+  const limit = toInteger(headers.get('x-ratelimit-limit'), undefined);
+  const remaining = toInteger(headers.get('x-ratelimit-remaining'), undefined);
+  if (limit === undefined && remaining === undefined) return undefined;
+  const reset = toInteger(headers.get('x-ratelimit-reset'), undefined);
+  const resource = headers.get('x-ratelimit-resource');
+  return {
+    ...(limit === undefined ? {} : { limit }),
+    ...(remaining === undefined ? {} : { remaining }),
+    ...(reset === undefined ? {} : { reset }),
+    ...(typeof resource === 'string' && resource.length > 0 ? { resource } : {}),
+  };
+}
+
+/** One line of guidance for a failed request, when a status suggests one. */
+function hintFor(status, remaining, transport) {
+  if (status === 0) {
+    return `the request never reached the server${typeof transport === 'string' ? ` (${transport})` : ''}; `
+      + 'check this machine\'s network and any proxy in the launch environment';
+  }
+  if (status === 401) return 'the key is missing, expired, or revoked; check the account and store a new one';
+  if (status === 403 && remaining === 0) return 'the rate limit is exhausted; wait until reset or use another account';
+  if (status === 403) return 'the key lacks permission for this resource, or a policy blocked the request';
+  if (status === 404) return 'the resource does not exist, or this key cannot see it';
+  if (status === 422) return 'the request body or query was rejected; read the returned errors';
+  if (status === 429) return 'too many requests; back off before retrying';
+  return undefined;
+}
+
 /**
- * One GitHub request. The body is read and bounded here so no tool result can
+ * One platform request. The body is read and bounded here so no tool result can
  * carry an unbounded payload into the transcript.
  */
-async function githubRequest(config, options) {
+async function platformRequest(config, platform, options) {
   let base;
   try {
-    base = new URL(config.baseUrl);
+    base = new URL(platform.baseUrl);
   } catch {
-    throw new Error(`github: baseUrl "${config.baseUrl}" is not a valid http(s) URL`);
+    throw new Error(`${platform.id}: baseUrl "${platform.baseUrl}" is not a valid http(s) URL`);
   }
   if (base.protocol !== 'https:' && base.protocol !== 'http:') {
-    throw new Error(`github: baseUrl "${config.baseUrl}" must use http or https`);
+    throw new Error(`${platform.id}: baseUrl "${platform.baseUrl}" must use http or https`);
   }
 
   const { signal, dispose } = requestSignal(config.requestTimeoutMs, options.signal);
@@ -254,6 +471,18 @@ async function githubRequest(config, options) {
       redirect: 'follow',
     });
     text = await response.text();
+  } catch (error) {
+    // A transport failure is a fact about this call, not a defect in the tool:
+    // report it as a failed result so the model can react instead of the turn
+    // breaking on a thrown error.
+    if (error instanceof Error && error.name === 'AbortError') throw error;
+    return {
+      ok: false,
+      status: 0,
+      data: '',
+      truncated: false,
+      transport: error instanceof Error ? error.message : String(error),
+    };
   } finally {
     dispose();
   }
@@ -294,13 +523,13 @@ async function githubRequest(config, options) {
   };
 }
 
-/** Build the request URL from the configured host plus a relative path. */
-function buildUrl(config, path, query) {
-  const base = new URL(config.baseUrl);
+/** Build the request URL from the platform base plus a relative path. */
+function buildUrl(platform, path, query) {
+  const base = new URL(platform.baseUrl);
   const prefix = base.pathname.replace(/\/+$/u, '');
   const url = new URL(`${prefix}${path}`, base.origin);
   if (url.origin !== base.origin) {
-    throw new Error('github_api refused to leave the configured GitHub host');
+    throw new Error(`${platform.id} refused to leave its configured host`);
   }
   for (const [name, value] of Object.entries(asObject(query))) {
     if (value === undefined || value === null) continue;
@@ -309,27 +538,18 @@ function buildUrl(config, path, query) {
   return url;
 }
 
-/** Shared headers for every GitHub request. */
-function githubHeaders(config, token) {
-  return {
-    accept: 'application/vnd.github+json',
-    'x-github-api-version': config.apiVersion,
-    'user-agent': config.userAgent,
-    ...(token === undefined ? {} : { authorization: `Bearer ${token}` }),
-  };
-}
-
 /** Text helper for tool rendering. */
 function text(body) {
   return [{ type: 'text', text: body }];
 }
 
-const API_OUTPUT_SCHEMA = {
+const CALL_OUTPUT_SCHEMA = {
   type: 'object',
   additionalProperties: false,
   properties: {
-    ok: { type: 'boolean', description: 'Whether GitHub answered with a 2xx status.' },
+    ok: { type: 'boolean', description: 'Whether the platform answered with a 2xx status.' },
     status: { type: 'integer', description: 'HTTP status code.' },
+    platform: { type: 'string', description: 'Platform id the request went to.' },
     method: { type: 'string', description: 'HTTP method used.' },
     url: { type: 'string', description: 'Full request URL, including any query string.' },
     account: { type: 'string', description: 'Credential account that authorized the call.' },
@@ -342,11 +562,10 @@ const API_OUTPUT_SCHEMA = {
     rateLimit: {
       type: 'object',
       additionalProperties: false,
-      description: 'GitHub rate-limit headers when present.',
+      description: 'Rate-limit headers when present.',
       properties: {
         limit: { type: 'integer' },
         remaining: { type: 'integer' },
-        used: { type: 'integer' },
         reset: { type: 'integer', description: 'Unix seconds at which the window resets.' },
         resource: { type: 'string' },
       },
@@ -361,14 +580,20 @@ const API_OUTPUT_SCHEMA = {
       },
     },
     hint: { type: 'string', description: 'What the status usually means, on a failed request.' },
+    transport: {
+      type: 'string',
+      description: 'The transport failure text when status is 0 and the request never reached the server.',
+    },
   },
-  required: ['ok', 'status', 'method', 'url', 'account', 'credentialSource', 'truncated', 'data'],
+  required: ['ok', 'status', 'platform', 'method', 'url', 'account', 'credentialSource', 'truncated', 'data'],
 };
 
-/** Render one `github_api` result as the model-facing text. */
-function renderApi(_args, value) {
-  const lines = [`${value.method} ${value.url} -> ${value.status}${value.ok ? '' : ' (failed)'}`];
-  lines.push(`account: ${value.account} (${value.credentialSource})`);
+/** Render one `apikey_call` result as the model-facing text. */
+function renderCall(_args, value) {
+  const lines = [value.status === 0
+    ? `${value.method} ${value.url} -> no response`
+    : `${value.method} ${value.url} -> ${value.status}${value.ok ? '' : ' (failed)'}`];
+  lines.push(`platform: ${value.platform} · account: ${value.account} (${value.credentialSource})`);
   if (value.rateLimit !== undefined && value.rateLimit.remaining !== undefined) {
     const limit = value.rateLimit.limit === undefined ? '?' : String(value.rateLimit.limit);
     lines.push(`rate limit: ${value.rateLimit.remaining}/${limit} remaining`);
@@ -390,46 +615,59 @@ function renderApi(_args, value) {
   return text(lines.join('\n'));
 }
 
-const ACCOUNTS_OUTPUT_SCHEMA = {
+const PLATFORMS_OUTPUT_SCHEMA = {
   type: 'object',
   additionalProperties: false,
   properties: {
-    accounts: {
+    platforms: {
       type: 'array',
-      description: 'Every account this plugin can use; values are never included.',
+      description: 'Every platform this plugin can serve, with its accounts.',
       items: {
         type: 'object',
         additionalProperties: false,
         properties: {
-          name: { type: 'string' },
-          configured: { type: 'boolean' },
-          source: { type: 'string' },
-          isDefault: { type: 'boolean' },
+          id: { type: 'string' },
+          label: { type: 'string' },
+          baseUrl: { type: 'string' },
+          custom: { type: 'boolean', description: 'Whether the platform came from configuration.' },
+          accounts: {
+            type: 'array',
+            items: {
+              type: 'object',
+              additionalProperties: false,
+              properties: {
+                name: { type: 'string' },
+                configured: { type: 'boolean' },
+                source: { type: 'string' },
+                isDefault: { type: 'boolean' },
+              },
+              required: ['name', 'configured', 'source', 'isDefault'],
+            },
+          },
         },
-        required: ['name', 'configured', 'source', 'isDefault'],
+        required: ['id', 'label', 'baseUrl', 'custom', 'accounts'],
       },
     },
+    defaultPlatform: { type: 'string' },
     defaultAccount: { type: 'string' },
     envFallback: { type: 'boolean' },
-    envName: { type: 'string' },
-    baseUrl: { type: 'string' },
     storeAvailable: { type: 'boolean', description: 'Whether this profile has a credentials service.' },
   },
-  required: ['accounts', 'defaultAccount', 'envFallback', 'envName', 'baseUrl', 'storeAvailable'],
+  required: ['platforms', 'defaultPlatform', 'defaultAccount', 'envFallback', 'storeAvailable'],
 };
 
-function renderAccounts(_args, value) {
-  const lines = [`default account: ${value.defaultAccount}`];
-  lines.push(`host: ${value.baseUrl}`);
-  if (value.accounts.length === 0) lines.push('no accounts');
-  for (const account of value.accounts) {
-    const state = account.configured ? `configured (${account.source})` : 'no token';
-    lines.push(`- ${account.name}${account.isDefault ? ' [default]' : ''}: ${state}`);
+function renderPlatforms(_args, value) {
+  const lines = [];
+  if (value.platforms.length === 0) lines.push('no platforms are enabled');
+  for (const platform of value.platforms) {
+    lines.push(`${platform.id}${platform.id === value.defaultPlatform ? ' [default platform]' : ''} — ${platform.baseUrl}`);
+    for (const account of platform.accounts) {
+      const state = account.configured ? `configured (${account.source})` : 'no key';
+      lines.push(`  - ${account.name}${account.isDefault ? ' [default account]' : ''}: ${state}`);
+    }
   }
-  if (value.envFallback) {
-    lines.push(`fallback: ${value.envName} is used for the default account when no token is stored`);
-  }
-  if (!value.storeAvailable) lines.push('this profile has no credentials service; tokens cannot be stored');
+  if (value.envFallback) lines.push('fallback: each platform\'s environment variable (e.g. GITHUB_TOKEN) is used for its default account when no key is stored');
+  if (!value.storeAvailable) lines.push('this profile has no credentials service; keys cannot be stored');
   return text(lines.join('\n'));
 }
 
@@ -439,46 +677,54 @@ const KEY_OUTPUT_SCHEMA = {
   properties: {
     ok: { type: 'boolean' },
     action: { type: 'string' },
+    platform: { type: 'string' },
     account: { type: 'string' },
     configured: { type: 'boolean' },
     source: { type: 'string' },
-    value: { type: 'string', description: 'The token, for action "get" only.' },
+    value: { type: 'string', description: 'The key, for action "get" only.' },
     message: { type: 'string' },
   },
-  required: ['ok', 'action', 'account', 'configured'],
+  required: ['ok', 'action', 'platform', 'account', 'configured'],
 };
 
 function renderKey(_args, value) {
   if (value.action === 'get') {
     if (value.ok && typeof value.value === 'string') {
-      return text(`account "${value.account}" (${value.source})\n${value.value}`);
+      return text(`${value.platform} · ${value.account} (${value.source})\n${value.value}`);
     }
-    return text(`account "${value.account}" is not configured${value.message === undefined ? '' : `: ${value.message}`}`);
+    return text(`${value.platform} · ${value.account} is not configured${value.message === undefined ? '' : `: ${value.message}`}`);
   }
-  if (value.action === 'set') return text(`account "${value.account}" stored`);
-  return text(`account "${value.account}" removed`);
+  if (value.action === 'set') return text(`${value.platform} · ${value.account} stored`);
+  return text(`${value.platform} · ${value.account} removed`);
 }
 
 /**
  * Register the three tools in the scope that resolved the `tools` service.
  * @param ctx - context owning `tools` and `credentials`.
  * @param config - normalized row configuration.
+ * @param platforms - resolved platform map.
  */
-function registerTools(ctx, config) {
+function registerTools(ctx, config, platforms) {
+  const platformIds = [...platforms.keys()];
+
   ctx.tools.register({
-    name: 'github_api',
+    name: 'apikey_call',
     description:
-      'Call the GitHub REST API with the user\'s stored token. `path` is relative to the configured host '
-      + '(for example "/repos/octocat/Hello-World/issues" or "/search/issues"), and `query`/`body` carry '
-      + 'parameters and JSON. Returns the status, the parsed body (bounded), rate-limit and page numbers. '
-      + 'Ask with github_accounts which credential exists before you rely on a private repository.',
+      'Call an API on one of the user\'s configured platforms using its stored key. `platform` picks the '
+      + 'service (which fixes the host), `path` is relative to that platform\'s API base, and `query`/`body` '
+      + 'carry parameters and JSON. Returns status, parsed body (bounded), rate-limit and page numbers. '
+      + `Available platforms: ${platformIds.join(', ')}. Ask apikey_platforms which accounts exist first.`,
     parameters: {
       type: 'object',
       additionalProperties: false,
       properties: {
+        platform: {
+          type: 'string',
+          description: `Platform id. One of: ${platformIds.join(', ')}.`,
+        },
         path: {
           type: 'string',
-          description: 'Path on the GitHub API host, starting with "/". Absolute URLs are refused.',
+          description: 'Path on the platform\'s API host, starting with "/". Absolute URLs are refused.',
         },
         method: {
           type: 'string',
@@ -500,100 +746,134 @@ function registerTools(ctx, config) {
           description: 'Request body for POST, PATCH, PUT and DELETE. Omit it for GET.',
         },
       },
-      required: ['path'],
+      required: ['platform', 'path'],
     },
-    output: { schema: API_OUTPUT_SCHEMA, render: renderApi },
+    output: { schema: CALL_OUTPUT_SCHEMA, render: renderCall },
     isConcurrencySafe(args) {
       return normalizeMethod(asObject(args).method) === 'GET';
     },
     async execute(args, exec) {
       const input = asObject(args);
+      const platformId = normalizeLooseName(input.platform);
+      if (platformId === undefined) {
+        throw new Error(`apikey_call "platform" must be one of: ${platformIds.join(', ')}`);
+      }
+      const platform = platforms.get(platformId);
+      if (platform === undefined) {
+        throw new Error(
+          `apikey_call "platform" is "${platformId}", which is not enabled here. `
+          + `Enabled platforms: ${platformIds.join(', ')}.`,
+        );
+      }
+
       const method = normalizeMethod(input.method);
       if (method === undefined) {
-        throw new Error(`github_api method must be one of ${METHODS.join(', ')}`);
+        throw new Error(`apikey_call method must be one of ${METHODS.join(', ')}`);
       }
 
       const path = typeof input.path === 'string' ? input.path.trim() : '';
       if (path.length === 0) {
-        throw new Error('github_api requires "path", for example "/repos/octocat/Hello-World"');
+        throw new Error(`apikey_call requires "path", for example "/user"`);
       }
       if (!path.startsWith('/') || path.startsWith('//') || /^[A-Za-z][A-Za-z0-9+.-]*:/u.test(path)) {
-        throw new Error('github_api "path" must be a path on the configured GitHub host, starting with "/"');
+        throw new Error(`apikey_call "path" must be a path on ${platformId}'s host, starting with "/"`);
       }
 
       let account;
       if (input.account === undefined || input.account === null || input.account === '') {
         account = config.defaultAccount;
       } else {
-        account = normalizeAccount(input.account);
+        account = normalizeAccountName(input.account);
         if (account === undefined) {
-          throw new Error('github_api "account" must be lowercase letters, digits and dashes, starting with a letter');
+          throw new Error(
+            'apikey_call "account" must be lowercase letters and digits, starting with a letter '
+            + `(got ${JSON.stringify(String(input.account))})`,
+          );
         }
       }
 
-      const url = buildUrl(config, path, input.query);
-      const credential = await accountToken(ctx, config, account);
+      const url = buildUrl(platform, path, input.query);
+      const credential = await accountKey(ctx, config, platform, account);
+      if (credential.key !== undefined) applyQueryAuth(platform, url, credential.key);
+
+      const headers = credential.key === undefined
+        ? { 'user-agent': config.userAgent, ...(platform.headers ?? {}) }
+        : { 'user-agent': config.userAgent, ...authHeaders(platform, credential.key) };
+
       const body = input.body !== undefined && (method === 'POST' || method === 'PATCH' || method === 'PUT' || method === 'DELETE')
         ? JSON.stringify(input.body)
         : undefined;
 
-      const response = await githubRequest(config, {
+      const response = await platformRequest(config, platform, {
         url,
         method,
         headers: {
-          ...githubHeaders(config, credential.token),
+          ...headers,
           ...(body === undefined ? {} : { 'content-type': 'application/json' }),
         },
         body,
         signal: exec.signal,
       });
 
-      const hint = response.ok ? undefined : hintFor(response.status, response.rateLimit?.remaining);
+      const hint = response.ok
+        ? undefined
+        : hintFor(response.status, response.rateLimit?.remaining, response.transport);
       return {
         ok: response.ok,
         status: response.status,
+        platform: platformId,
         method,
         url: url.toString(),
         account,
-        credentialSource: credential.token === undefined ? 'unset' : credential.source,
+        credentialSource: credential.key === undefined ? 'unset' : credential.source,
         truncated: response.truncated,
         data: response.data,
         ...(response.rateLimit === undefined ? {} : { rateLimit: response.rateLimit }),
         ...(response.pagination === undefined ? {} : { pagination: response.pagination }),
         ...(hint === undefined ? {} : { hint }),
+        ...(response.transport === undefined ? {} : { transport: response.transport }),
       };
     },
   });
 
   ctx.tools.register({
-    name: 'github_accounts',
+    name: 'apikey_platforms',
     description:
-      'List the GitHub credential accounts available to this Harness: their names, whether a token is '
-      + 'configured, and where it comes from. Never returns token values. Use it to choose the `account` '
-      + 'for github_api, or to tell the user which account still needs a token.',
+      'List the API platforms configured in this Harness and the credential accounts stored for each: '
+      + 'whether a key is configured and where it comes from. Never returns key values. Use it to choose '
+      + 'the platform and account for apikey_call, or to tell the user which platform still needs a key.',
     parameters: { type: 'object', additionalProperties: false, properties: {} },
-    output: { schema: ACCOUNTS_OUTPUT_SCHEMA, render: renderAccounts },
+    output: { schema: PLATFORMS_OUTPUT_SCHEMA, render: renderPlatforms },
     isConcurrencySafe: () => true,
     async execute() {
+      const rows = [];
+      for (const platform of platforms.values()) {
+        rows.push({
+          id: platform.id,
+          label: platform.label,
+          baseUrl: platform.baseUrl,
+          custom: platform.custom === true,
+          accounts: await listAccounts(ctx, config, platform),
+        });
+      }
       return {
-        accounts: await listAccounts(ctx, config),
+        platforms: rows,
+        defaultPlatform: config.defaultPlatform,
         defaultAccount: config.defaultAccount,
         envFallback: config.envFallback,
-        envName: config.envName,
-        baseUrl: config.baseUrl,
         storeAvailable: ctx.get('credentials') !== undefined,
       };
     },
   });
 
   ctx.tools.register({
-    name: 'github_key',
+    name: 'apikey_key',
     description:
-      'Read or manage one GitHub API token by account name. action "get" returns the token itself and is '
+      'Read or manage one platform API key by account name. action "get" returns the key itself and is '
       + (config.exposeKeys ? 'enabled here' : 'disabled by this plugin\'s configuration')
       + '; use it only when the user asks for the key or needs it for another service. '
-      + 'action "set" stores a token the user supplied; action "clear" removes the stored token and falls '
-      + 'back to the environment reference, if any.',
+      + 'action "set" stores a key the user supplied; action "clear" removes the stored key and falls '
+      + 'back to the platform\'s environment reference, if any.',
     parameters: {
       type: 'object',
       additionalProperties: false,
@@ -601,84 +881,99 @@ function registerTools(ctx, config) {
         action: {
           type: 'string',
           enum: ['get', 'set', 'clear'],
-          description: '`get` reveals the token, `set` stores one, `clear` removes the stored one.',
+          description: '`get` reveals the key, `set` stores one, `clear` removes the stored one.',
+        },
+        platform: {
+          type: 'string',
+          description: `Platform id. One of: ${platformIds.join(', ')}.`,
         },
         account: {
           type: 'string',
-          description: 'Account name (lowercase, digits, dashes). Defaults to the configured default account.',
+          description: 'Account name (lowercase letters and digits). Defaults to the configured default account.',
         },
         value: {
           type: 'string',
-          description: 'The token to store; required for action "set" and ignored otherwise.',
+          description: 'The key to store; required for action "set" and ignored otherwise.',
         },
       },
-      required: ['action'],
+      required: ['action', 'platform'],
     },
     output: { schema: KEY_OUTPUT_SCHEMA, render: renderKey },
     async execute(args, exec) {
       const input = asObject(args);
       const action = typeof input.action === 'string' ? input.action.trim().toLowerCase() : '';
       if (action !== 'get' && action !== 'set' && action !== 'clear') {
-        throw new Error('github_key "action" must be "get", "set" or "clear"');
+        throw new Error('apikey_key "action" must be "get", "set" or "clear"');
+      }
+      const platformId = normalizeLooseName(input.platform);
+      const platform = platformId === undefined ? undefined : platforms.get(platformId);
+      if (platform === undefined) {
+        throw new Error(`apikey_key "platform" must be one of: ${platformIds.join(', ')}`);
       }
       const account = input.account === undefined || input.account === null || input.account === ''
         ? config.defaultAccount
-        : normalizeAccount(input.account);
+        : normalizeAccountName(input.account);
       if (account === undefined) {
-        throw new Error('github_key "account" must be lowercase letters, digits and dashes, starting with a letter');
+        throw new Error(
+          'apikey_key "account" must be lowercase letters and digits, starting with a letter '
+          + `(got ${JSON.stringify(String(input.account))})`,
+        );
       }
 
       if (action === 'get') {
         if (!config.exposeKeys) {
           throw new Error(
-            'github_key cannot reveal tokens: exposeKeys is false in this plugin\'s configuration. '
-            + 'Use github_api so the token stays inside the Host, or ask the user to change exposeKeys.',
+            'apikey_key cannot reveal keys: exposeKeys is false in this plugin\'s configuration. '
+            + 'Use apikey_call so the key stays inside the Host, or ask the user to change exposeKeys.',
           );
         }
-        if (exec.signal !== undefined && exec.signal.aborted) throw new Error('github_key was cancelled');
-        const credential = await accountToken(ctx, config, account);
-        if (credential.token === undefined) {
+        if (exec.signal !== undefined && exec.signal.aborted) throw new Error('apikey_key was cancelled');
+        const credential = await accountKey(ctx, config, platform, account);
+        if (credential.key === undefined) {
           return {
             ok: false,
             action,
+            platform: platform.id,
             account,
             configured: false,
             source: credential.source,
-            message: `no token is stored for "${account}" and no ${config.envName} fallback applies`,
+            message: 'no key is stored for this account and no environment fallback applies',
           };
         }
         return {
           ok: true,
           action,
+          platform: platform.id,
           account,
           configured: true,
           source: credential.source,
-          value: credential.token,
+          value: credential.key,
         };
       }
 
       if (action === 'set') {
         const value = typeof input.value === 'string' ? input.value.trim() : '';
-        if (value.length === 0) throw new Error('github_key action "set" requires a non-empty "value"');
-        if (value.length > 4096) throw new Error('github_key "value" is longer than any GitHub token');
-        await storeToken(ctx, config, account, value);
-        return { ok: true, action, account, configured: true, source: 'stored' };
+        if (value.length === 0) throw new Error('apikey_key action "set" requires a non-empty "value"');
+        if (value.length > 8192) throw new Error('apikey_key "value" is longer than any API key');
+        await storeKey(ctx, platform, account, value);
+        return { ok: true, action, platform: platform.id, account, configured: true, source: 'stored' };
       }
 
-      await removeToken(ctx, account);
-      const remaining = await accountToken(ctx, config, account);
+      await removeKey(ctx, platform, account);
+      const remaining = await accountKey(ctx, config, platform, account);
       return {
         ok: true,
         action,
+        platform: platform.id,
         account,
-        configured: remaining.token !== undefined,
+        configured: remaining.key !== undefined,
         source: remaining.source,
       };
     },
   });
 }
 
-/** Whether one HTTP request may reach the token bridge. */
+/** Whether one HTTP request may reach the key bridge. */
 function isBridgeRequestAllowed(request, trust) {
   const host = request.headers?.host;
   if (typeof host !== 'string' || host.length === 0) return false;
@@ -742,18 +1037,39 @@ async function readJson(request) {
   }
 }
 
-/** The bridge surface the Client page uses. Every reply is `{ ok, value }` or `{ ok: false, code, message }`. */
-function createBridge(ctx, config, trust) {
+/** The bridge surface the Client page uses. */
+function createBridge(ctx, config, platforms, trust) {
+  const status = async () => {
+    const rows = [];
+    for (const platform of platforms.values()) {
+      rows.push({
+        id: platform.id,
+        label: platform.label,
+        baseUrl: platform.baseUrl,
+        custom: platform.custom === true,
+        docs: platform.docs,
+        hint: platform.hint,
+        note: platform.note,
+        envName: platform.envName,
+        accounts: await listAccounts(ctx, config, platform),
+      });
+    }
+    return {
+      platforms: rows,
+      defaultPlatform: config.defaultPlatform,
+      defaultAccount: config.defaultAccount,
+      envFallback: config.envFallback,
+      exposeKeys: config.exposeKeys,
+      storeAvailable: ctx.get('credentials') !== undefined,
+    };
+  };
 
-  const status = async () => ({
-    accounts: await listAccounts(ctx, config),
-    defaultAccount: config.defaultAccount,
-    envFallback: config.envFallback,
-    envName: config.envName,
-    exposeKeys: config.exposeKeys,
-    baseUrl: config.baseUrl,
-    storeAvailable: ctx.get('credentials') !== undefined,
-  });
+  const pick = (body) => {
+    const platformId = normalizeLooseName(body.platform);
+    const platform = platformId === undefined ? undefined : platforms.get(platformId);
+    const account = normalizeAccountName(body.account ?? config.defaultAccount);
+    return { platform, account, platformId };
+  };
 
   const handlers = {
     async status() {
@@ -761,57 +1077,74 @@ function createBridge(ctx, config, trust) {
     },
 
     async set(body) {
-      const account = normalizeAccount(body.account ?? config.defaultAccount);
-      if (account === undefined) {
-        return { ok: false, code: 'invalid-account', message: 'account must be lowercase letters, digits and dashes' };
+      const { platform, account } = pick(body);
+      if (platform === undefined) {
+        return { ok: false, code: 'unknown-platform', message: 'that platform is not enabled here' };
       }
-      const token = typeof body.token === 'string' ? body.token.trim() : '';
-      if (token.length === 0) return { ok: false, code: 'empty-token', message: 'the token is empty' };
-      if (token.length > 4096) return { ok: false, code: 'long-token', message: 'the token is longer than any GitHub token' };
-      await storeToken(ctx, config, account, token);
+      if (account === undefined) {
+        return { ok: false, code: 'invalid-account', message: 'account must be lowercase letters and digits' };
+      }
+      const key = typeof body.token === 'string' ? body.token.trim() : '';
+      if (key.length === 0) return { ok: false, code: 'empty-token', message: 'the key is empty' };
+      if (key.length > 8192) return { ok: false, code: 'long-token', message: 'the key is longer than any API key' };
+      await storeKey(ctx, platform, account, key);
       return { ok: true, value: await status() };
     },
 
     async clear(body) {
-      const account = normalizeAccount(body.account ?? config.defaultAccount);
-      if (account === undefined) {
-        return { ok: false, code: 'invalid-account', message: 'account must be lowercase letters, digits and dashes' };
+      const { platform, account } = pick(body);
+      if (platform === undefined) {
+        return { ok: false, code: 'unknown-platform', message: 'that platform is not enabled here' };
       }
-      await removeToken(ctx, account);
+      if (account === undefined) {
+        return { ok: false, code: 'invalid-account', message: 'account must be lowercase letters and digits' };
+      }
+      await removeKey(ctx, platform, account);
       return { ok: true, value: await status() };
     },
 
     async verify(body) {
-      const account = normalizeAccount(body.account ?? config.defaultAccount);
+      const { platform, account } = pick(body);
+      if (platform === undefined) {
+        return { ok: false, code: 'unknown-platform', message: 'that platform is not enabled here' };
+      }
       if (account === undefined) {
-        return { ok: false, code: 'invalid-account', message: 'account must be lowercase letters, digits and dashes' };
+        return { ok: false, code: 'invalid-account', message: 'account must be lowercase letters and digits' };
       }
-      const credential = await accountToken(ctx, config, account);
-      if (credential.token === undefined) {
-        return { ok: false, code: 'no-token', message: `no token is stored for "${account}"` };
+      if (platform.verify === undefined) {
+        return { ok: false, code: 'no-verify', message: 'this platform does not declare a verification endpoint' };
       }
-      const url = buildUrl(config, '/user', undefined);
-      const response = await githubRequest(config, {
+
+      const credential = await accountKey(ctx, config, platform, account);
+      if (credential.key === undefined) {
+        return { ok: false, code: 'no-token', message: `no key is stored for "${account}"` };
+      }
+
+      const url = buildUrl(platform, platform.verify.path, undefined);
+      applyQueryAuth(platform, url, credential.key);
+      const response = await platformRequest(config, platform, {
         url,
         method: 'GET',
-        headers: githubHeaders(config, credential.token),
+        headers: { 'user-agent': config.userAgent, ...authHeaders(platform, credential.key) },
       });
+
       if (!response.ok) {
         return {
           ok: false,
-          code: `github-${response.status}`,
-          message: hintFor(response.status, response.rateLimit?.remaining) ?? `GitHub answered ${response.status}`,
+          code: `${platform.id}-${response.status}`,
+          message: hintFor(response.status, response.rateLimit?.remaining, response.transport)
+            ?? `${platform.label} answered ${response.status}`,
         };
       }
-      const profile = asObject(response.data);
+
       return {
         ok: true,
         value: {
+          platform: platform.id,
           account,
           source: credential.source,
-          login: typeof profile.login === 'string' ? profile.login : undefined,
-          name: typeof profile.name === 'string' ? profile.name : undefined,
-          rateLimit: response.rateLimit,
+          identity: readPath(response.data, platform.verify.identity),
+          status: response.status,
         },
       };
     },
@@ -832,7 +1165,7 @@ function createBridge(ctx, config, trust) {
         writeJson(response, 403, {
           ok: false,
           code: 'forbidden',
-          message: 'the GitHub key bridge only answers same-origin requests from this machine',
+          message: 'the API key bridge only answers same-origin requests from this machine',
         });
         return;
       }
@@ -863,6 +1196,34 @@ function createBridge(ctx, config, trust) {
 }
 
 /**
+ * Adopt a key the earlier GitHub-only plugin stored under `dsh-github/<account>`.
+ * It only runs once per account, never overwrites a key the new layout already
+ * holds, and never deletes the old record.
+ */
+async function migrateFromGitHubPlugin(ctx, config) {
+  const credentials = ctx.get('credentials');
+  if (credentials === undefined || config.migrateGitHub !== true) return;
+
+  for (const entry of await credentials.listRecords()) {
+    const key = String(entry?.key ?? '');
+    if (!key.startsWith('dsh-github/')) continue;
+    const account = normalizeAccountName(key.slice('dsh-github/'.length));
+    if (account === undefined) continue;
+
+    const target = `${CREDENTIAL_SCOPE}/${recordId('github', account)}`;
+    if (await credentials.readRecord(target) !== undefined) continue;
+
+    const previous = await credentials.readRecord(key);
+    if (previous === undefined || previous === null
+      || previous.kind !== 'api-key'
+      || typeof previous.key !== 'string' || previous.key.length === 0) continue;
+
+    await credentials.modifyRecord(target, async () => ({ kind: 'api-key', key: previous.key }));
+    ctx.logger?.info?.(`apikeys: adopted the GitHub key for account "${account}" from the earlier plugin layout`);
+  }
+}
+
+/**
  * Mount the tools and the bridge. Each registration is an effect owned by this
  * plugin, so unloading removes both surfaces.
  * @param ctx - the plugin context.
@@ -870,6 +1231,7 @@ function createBridge(ctx, config, trust) {
  */
 export function apply(ctx, rawConfig) {
   const config = readConfig(rawConfig);
+  const platforms = resolvePlatforms(config);
   // Trusted authorities for the key bridge. The deployment's own trusted hosts
   // join this list when the Web startup facts are available; without them the
   // bridge answers loopback requests only.
@@ -877,18 +1239,31 @@ export function apply(ctx, rawConfig) {
 
   ctx.inject(['tools'], (toolsCtx) => {
     toolsCtx.effect(() => {
-      registerTools(toolsCtx, config);
+      registerTools(toolsCtx, config, platforms);
       return () => {};
-    }, 'dsh-github: tools');
+    }, 'dsh-apikeys: tools');
   });
 
   ctx.inject(['webServer'], (serverCtx) => {
     serverCtx.effect(() => {
-      const disposers = createBridge(serverCtx, config, trust).map((route) => serverCtx.webServer.register(route));
+      const disposers = createBridge(serverCtx, config, platforms, trust)
+        .map((route) => serverCtx.webServer.register(route));
       return () => {
         for (const dispose of disposers) dispose();
       };
-    }, 'dsh-github: key bridge');
+    }, 'dsh-apikeys: key bridge');
+  });
+
+  ctx.inject(['credentials'], (credentialsCtx) => {
+    credentialsCtx.effect(() => {
+      let cancelled = false;
+      migrateFromGitHubPlugin(credentialsCtx, config).catch((error) => {
+        if (!cancelled) ctx.logger?.warn?.(`apikeys: could not adopt the earlier GitHub key: ${String(error)}`);
+      });
+      return () => {
+        cancelled = true;
+      };
+    }, 'dsh-apikeys: adopt earlier keys');
   });
 
   ctx.inject(['webStartup'], (startupCtx) => {
@@ -911,12 +1286,13 @@ export function apply(ctx, rawConfig) {
       return () => {
         trust.hosts.length = 0;
       };
-    }, 'dsh-github: bridge trust');
+    }, 'dsh-apikeys: bridge trust');
   });
 
   ctx.logger?.info?.(
-    `github: base ${config.baseUrl}, default account "${config.defaultAccount}", `
+    `apikeys: ${platforms.size} platform(s) [${[...platforms.keys()].join(', ')}], `
+    + `default ${config.defaultPlatform}/${config.defaultAccount}, `
     + `key reveal ${config.exposeKeys ? 'enabled' : 'disabled'}, `
-    + `environment fallback ${config.envFallback ? config.envName : 'off'}`,
+    + `environment fallback ${config.envFallback ? 'on' : 'off'}`,
   );
 }
