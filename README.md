@@ -115,7 +115,7 @@ Client page ──POST /api/dsh-apikeys/{status,set,clear,verify}──▶ Host 
 model ── apikey_call / apikey_platforms / apikey_key ─────────────┘
 ```
 
-The Host half imports nothing. Every collaborator (`tools`, `webServer`, `credentials`, `webStartup`) is resolved through the Cordis context, so the bundle keeps loading across DSH versions that keep those seams.
+Every collaborator (`tools`, `webServer`, `credentials`, `webStartup`) is resolved through the Cordis context, so the bundle keeps loading across DSH versions that keep those seams. The one import is `@deepseek-ai/schemastery`, because a plugin's `Config` has to be a Schema — a row without one gets no configure control on the Plugins page.
 
 ### Files
 
@@ -134,6 +134,7 @@ dev/               Verification scripts (not published)
 Checked against every DSH mechanism this depends on, using the runtime's own validators:
 
 - Every registered `parameters` and `output.schema` accepted by `assertSupportedJsonSchema`, and model arguments checked through `validateJsonSchemaValue`.
+- The exported `Config` schema resolves its defaults, accepts a partial row, and mounts the same six platforms those defaults describe.
 - All five auth kinds driven end to end: bearer, custom header, `x-api-key`, basic (username:key), and query-string.
 - Each built-in platform's verify path probed against the live API — a real endpoint answers 401/403/400 for a bad key, and a wrong path answers 404. None return 404.
 - A transport failure returning status `0` with a hint instead of throwing.

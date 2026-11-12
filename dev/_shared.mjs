@@ -83,3 +83,77 @@ export function resolveDshTools() {
 export async function importDshTools() {
   return import(pathToFileURL(resolveDshTools()).href);
 }
+
+/**
+ * Resolve `@deepseek-ai/schemastery`.
+ *
+ * The plugin declares it as a dependency, so an installed profile already has
+ * it; a fresh clone has no `node_modules` at all. Rather than require a local
+ * install just to run the checks, borrow the copy from the DSH installation the
+ * rest of these scripts already point at.
+ */
+export function resolveSchemastery() {
+  const direct = process.env.DSH_SCHEMASTERY_PATH;
+  if (direct) {
+    if (!fs.existsSync(direct)) {
+      throw new Error(`DSH_SCHEMASTERY_PATH points at ${direct}, which does not exist`);
+    }
+    return direct;
+  }
+
+  const requireFromHere = createRequire(import.meta.url);
+  // A local install wins: it is what the package actually ships with.
+  try {
+    return requireFromHere.resolve('@deepseek-ai/schemastery');
+  } catch {
+    // fall through to the harness copy
+  }
+
+  for (const base of searchRoots()) {
+    const entry = path.join(base, '@deepseek-ai', 'schemastery', 'lib', 'index.js');
+    if (fs.existsSync(entry)) return entry;
+    try {
+      return requireFromHere.resolve('@deepseek-ai/schemastery', { paths: [base] });
+    } catch {
+      // try the next candidate
+    }
+  }
+
+  throw new Error(
+    'cannot locate @deepseek-ai/schemastery, so the plugin\'s Config schema cannot be checked.\n'
+    + 'Point at your installation either way:\n'
+    + '  DSH_SCHEMASTERY_PATH=/path/to/node_modules/@deepseek-ai/schemastery/lib/index.js\n'
+    + '  DSH_RUNTIME_DIR=/path/to/dsh-runtime',
+  );
+}
+
+/**
+ * Make `@deepseek-ai/schemastery` importable from the package root.
+ *
+ * `index.js` imports it by bare specifier, and a bare specifier is resolved by
+ * Node's own loader — no hook here can redirect it. A fresh clone therefore
+ * needs a `node_modules` entry before the plugin can be imported at all. This
+ * creates one that points at the harness copy, and reports the directory so the
+ * caller can remove it afterwards.
+ * @returns the created directory, or `undefined` when nothing was created.
+ */
+export function ensureSchemasteryReachable() {
+  const modulesDir = path.join(pluginDir, 'node_modules');
+  const linkDir = path.join(modulesDir, '@deepseek-ai');
+  const target = path.join(linkDir, 'schemastery');
+  if (fs.existsSync(target)) return undefined;
+
+  // Trim a trailing /lib/index.js down to the package root.
+  const entry = resolveSchemastery();
+  const packageRoot = path.basename(path.dirname(entry)) === 'lib'
+    ? path.dirname(path.dirname(entry))
+    : path.dirname(entry);
+
+  // Remember whether `node_modules` was already there, so cleanup removes only
+  // what this run created and never deletes a real install.
+  const modulesExisted = fs.existsSync(modulesDir);
+
+  fs.mkdirSync(linkDir, { recursive: true });
+  fs.symlinkSync(packageRoot, target, 'junction');
+  return modulesExisted ? linkDir : modulesDir;
+}

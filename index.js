@@ -12,10 +12,13 @@
  *    platform's API lives — `apikey_call` takes a path, never a URL.
  * 3. A same-origin bridge under `/api/dsh-apikeys` backs the settings page.
  *
- * The module imports nothing. Every collaborator is a Cordis service resolved
- * through the context, so the bundle keeps loading across Harness versions
- * that keep those seams.
+ * Every collaborator is a Cordis service resolved through the context, so the
+ * bundle keeps loading across Harness versions that keep those seams. The one
+ * import is `@deepseek-ai/schemastery`, because a plugin's `Config` has to be a
+ * Schema: without it the Host cannot project a configuration form, and the
+ * plugin's row on the Plugins page has no configure control.
  */
+import z from '@deepseek-ai/schemastery';
 
 const CREDENTIAL_SCOPE = 'dsh-apikeys';
 const BRIDGE_PREFIX = '/api/dsh-apikeys';
@@ -157,6 +160,71 @@ function normalizeMethod(raw) {
   const method = raw.trim().toUpperCase();
   return METHODS.includes(method) ? method : undefined;
 }
+
+/**
+ * The row configuration schema.
+ *
+ * Exporting this is what makes the plugin's row on the Plugins page show a
+ * configure control: the Host projects a form from it, and a row whose Config
+ * is absent gets no control at all. Defaults here mirror `readConfig`, which
+ * stays tolerant of hand-written YAML that predates this schema.
+ */
+const Config = z.object({
+  defaultPlatform: z.string().default('github').description(
+    'Platform a tool call uses when it names none.',
+  ),
+  defaultAccount: z.string().default(DEFAULT_ACCOUNT).description(
+    'Account a tool call uses when it names none.',
+  ),
+  enabledPlatforms: z.array(z.string()).default([
+    'github', 'cloudflare', 'vercel', 'npm', 'dockerhub', 'huggingface',
+  ]).description('Built-in platforms to expose. Omit to expose every built-in platform.'),
+  accounts: z.array(z.object({
+    platform: z.string(),
+    name: z.string(),
+  })).default([]).description(
+    'Account names to keep visible before they hold a key. Accounts added from the settings page are remembered for the running process; list them here to survive a restart.',
+  ),
+  customPlatforms: z.array(z.object({
+    id: z.string(),
+    label: z.string().default(''),
+    baseUrl: z.string(),
+    envName: z.string().default(''),
+    docs: z.string().default(''),
+    hint: z.string().default(''),
+    note: z.string().default(''),
+    verify: z.object({
+      path: z.string().default(''),
+      identity: z.string().default(''),
+    }).default({ path: '', identity: '' }),
+    auth: z.object({
+      kind: z.union(['bearer', 'header', 'x-api-key', 'basic', 'query']).default('bearer'),
+      header: z.string().default(''),
+      scheme: z.string().default(''),
+      username: z.string().default(''),
+      queryParam: z.string().default(''),
+    }).default({}),
+    headers: z.dict(z.string()).default({}),
+  })).default([]).description(
+    'Your own platforms: baseUrl, auth shape, and an optional verification endpoint.',
+  ),
+  exposeKeys: z.boolean().default(true).description(
+    'Whether apikey_key get may return a key value. Turn off to keep keys inside the Host.',
+  ),
+  envFallback: z.boolean().default(true).description(
+    "Fall back to each platform's environment variable for its default account.",
+  ),
+  maxResponseChars: z.number().default(20000).min(2000).max(400000).description(
+    'Response body cap per call, in characters.',
+  ),
+  requestTimeoutMs: z.number().default(30000).min(1000).max(180000).description(
+    'Per-request timeout, in milliseconds.',
+  ),
+  userAgent: z.string().default('dsh-apikeys').description('User-Agent header sent with each call.'),
+  migrateGitHub: z.boolean().default(true).description(
+    'Adopt keys the earlier github-only plugin left under dsh-github/<account>.',
+  ),
+});
 
 /** Read the row configuration with defaults and no schema dependency. */
 function readConfig(raw) {
@@ -1312,7 +1380,7 @@ async function migrateFromGitHubPlugin(ctx, config) {
  * @param ctx - the plugin context.
  * @param rawConfig - the row configuration from `cordis.patch.yml`.
  */
-export function apply(ctx, rawConfig) {
+function apply(ctx, rawConfig) {
   const config = readConfig(rawConfig);
   const platforms = resolvePlatforms(config);
   // Account names registered from the settings page but not yet backed by a
@@ -1382,3 +1450,6 @@ export function apply(ctx, rawConfig) {
     + `environment fallback ${config.envFallback ? 'on' : 'off'}`,
   );
 }
+
+export { Config, apply };
+export const name = 'apikeys';

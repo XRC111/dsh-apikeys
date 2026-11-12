@@ -6,10 +6,16 @@
  * the bridge and the migration path with a stubbed credential store and a
  * stubbed `fetch`, so nothing leaves the machine.
  */
-import { importDshTools, importPlugin } from './_shared.mjs';
+import { ensureSchemasteryReachable, importDshTools, importPlugin } from './_shared.mjs';
+import fs from 'node:fs';
+
+// index.js imports @deepseek-ai/schemastery by bare specifier, which only
+// Node's own loader can resolve, so it has to be reachable before the import.
+const createdModules = ensureSchemasteryReachable();
 
 const { assertSupportedJsonSchema, validateJsonSchemaValue } = await importDshTools();
-const { apply } = await importPlugin('index.js');
+const plugin = await importPlugin('index.js');
+const { apply } = plugin;
 
 const failures = [];
 function check(condition, label) {
@@ -111,6 +117,42 @@ globalThis.fetch = async (url, init) => {
   }
   return json(500, { error: `unscripted host ${target}` });
 };
+
+// ---------------------------------------------------------- config schema
+// A plugin whose Config is absent gets no configure control on the Plugins
+// page, so the schema is part of the contract, not a nicety.
+console.log('config schema');
+check(typeof plugin.Config === 'function', 'the plugin exports a Config schema');
+check(plugin.name === 'apikeys', 'the plugin exports its row id as name');
+if (typeof plugin.Config === 'function') {
+  const defaults = plugin.Config({});
+  check(defaults.defaultPlatform === 'github', 'Config default: defaultPlatform');
+  check(defaults.defaultAccount === 'default', 'Config default: defaultAccount');
+  check(
+    Array.isArray(defaults.enabledPlatforms) && defaults.enabledPlatforms.length === 6,
+    'Config default: six enabled platforms',
+  );
+  check(defaults.exposeKeys === true, 'Config default: exposeKeys');
+  check(defaults.envFallback === true, 'Config default: envFallback');
+  check(defaults.maxResponseChars === 20000, 'Config default: maxResponseChars');
+  check(Array.isArray(defaults.accounts), 'Config accepts an accounts list');
+  check(Array.isArray(defaults.customPlatforms), 'Config accepts custom platforms');
+
+  // A hand-written row must still resolve, since patch files predate the schema.
+  const partial = plugin.Config({ defaultPlatform: 'npm' });
+  check(partial.defaultPlatform === 'npm', 'Config keeps a supplied value');
+  check(partial.exposeKeys === true, 'Config fills the rest from defaults');
+
+  // The defaults the schema produces must match what readConfig would decide.
+  const mounted = [];
+  const probeCtx = makeContext();
+  probeCtx.tools = { register(definition) { mounted.push(definition); return () => {}; } };
+  probeCtx.webServer = { register() { return () => {}; } };
+  apply(probeCtx, defaults);
+  const listedFromSchema = await mounted.find((tool) => tool.name === 'apikey_platforms')
+    .execute({}, { signal: new AbortController().signal });
+  check(listedFromSchema.platforms.length === 6, 'the schema defaults mount six platforms');
+}
 
 // ------------------------------------------------------------------ mount
 console.log('mount');
@@ -541,4 +583,13 @@ if (failures.length > 0) {
   process.exitCode = 1;
 } else {
   console.log('all host-half checks passed');
+}
+
+// Leave the working tree as it was found.
+if (createdModules !== undefined) {
+  try {
+    fs.rmSync(createdModules, { recursive: true, force: true });
+  } catch {
+    // A leftover link is harmless; failing the run over it is not worth it.
+  }
 }
