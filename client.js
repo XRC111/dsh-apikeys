@@ -55,10 +55,32 @@ window.__ModuleLoader__.load({
         'expose.title': '向模型开放 Key',
         'expose.on': '开：apikey_key get 可返回 Key',
         'expose.off': '关：Key 只在 Host 内使用',
+        'vault.title': '加密保管库',
+        'vault.locked': '已锁定',
+        'vault.unlocked': '已解锁',
+        'vault.disabled': '未启用',
+        'vault.unlock': '解锁',
+        'vault.lock': '锁定',
+        'vault.password': '主密码',
+        'vault.hint': '密码只用于在本次进程内解密，不写入磁盘。',
+        'vault.wrong': '主密码错误',
+        'vault.envHint': '也可以用环境变量 {name} 提供',
+        'audit.title': '审计日志',
+        'audit.show': '查看',
+        'audit.hide': '收起',
+        'audit.intact': '链完整（{n} 条）',
+        'audit.broken': '链已损坏：{reason}',
+        'audit.disabled': '未启用',
+        'audit.empty': '暂无记录',
+        'health.ok': '上次验证通过',
+        'health.fail': '上次验证失败',
+        'health.cooldown': '冷却中 {s}s',
+        'health.never': '未验证',
         'tools.title': '模型可用工具',
         'tools.call': 'apikey_call — 调用某平台 API（只能走该平台主机）',
         'tools.platforms': 'apikey_platforms — 列出平台与账号状态（不含 Key）',
         'tools.key': 'apikey_key — 读取 / 写入 / 清除某个 Key',
+        'tools.upload': 'apikey_upload — 上传本地文件（受 upload.roots 限制）',
         'note.docs': '文档',
       },
       en: {
@@ -106,10 +128,32 @@ window.__ModuleLoader__.load({
         'expose.title': 'Expose keys to the model',
         'expose.on': 'On: apikey_key get returns the key',
         'expose.off': 'Off: the key stays inside the Host',
+        'vault.title': 'Encrypted vault',
+        'vault.locked': 'locked',
+        'vault.unlocked': 'unlocked',
+        'vault.disabled': 'off',
+        'vault.unlock': 'Unlock',
+        'vault.lock': 'Lock',
+        'vault.password': 'Master password',
+        'vault.hint': 'The password only decrypts for this process; it is never written to disk.',
+        'vault.wrong': 'Wrong master password',
+        'vault.envHint': 'It can also come from the {name} environment variable',
+        'audit.title': 'Audit log',
+        'audit.show': 'Show',
+        'audit.hide': 'Hide',
+        'audit.intact': 'chain intact ({n} entries)',
+        'audit.broken': 'chain broken: {reason}',
+        'audit.disabled': 'off',
+        'audit.empty': 'nothing recorded yet',
+        'health.ok': 'last verify passed',
+        'health.fail': 'last verify failed',
+        'health.cooldown': 'cooling down {s}s',
+        'health.never': 'never verified',
         'tools.title': 'Tools the model can call',
         'tools.call': 'apikey_call — call one platform API (its own host only)',
         'tools.platforms': 'apikey_platforms — list platforms and account state (no values)',
         'tools.key': 'apikey_key — get / set / clear one key',
+        'tools.upload': 'apikey_upload — send a local file (bounded by upload.roots)',
         'note.docs': 'Docs',
       },
     };
@@ -127,6 +171,17 @@ window.__ModuleLoader__.load({
 .dak-chip[data-active="true"]{border-color:color-mix(in srgb, var(--dsw-alias-brand-primary) 55%, transparent);background:color-mix(in srgb, var(--dsw-alias-brand-primary) 12%, transparent);color:var(--dsw-alias-label-primary)}
 .dak-dot{display:inline-block;width:6px;height:6px;border-radius:50%;margin-right:5px;background:var(--dsw-alias-state-idle-primary);vertical-align:middle}
 .dak-chip[data-configured="true"] .dak-dot{background:var(--dsw-alias-state-success-primary)}
+.dak-chip[data-health="ok"] .dak-dot{background:var(--dsw-alias-state-success-primary)}
+.dak-chip[data-health="fail"] .dak-dot{background:var(--dsw-alias-state-error-primary)}
+.dak-chip[data-health="cooldown"] .dak-dot{background:var(--dsw-alias-state-warning-primary)}
+.dak-cool{margin-left:4px;font-size:10px;opacity:.75}
+.dak-sub2{color:var(--dsw-alias-label-secondary);font-size:11px;margin:0}
+.dak-code{font-family:var(--dsw-alias-font-mono,monospace);font-size:11px;color:var(--dsw-alias-label-secondary);overflow-wrap:anywhere}
+.dak-audit{max-height:220px;overflow:auto}
+.dak-audit table{border-collapse:collapse;width:100%;font-size:11px}
+.dak-audit td,.dak-audit th{padding:2px 6px;text-align:left;white-space:nowrap;border-bottom:1px solid var(--dsw-alias-border-l1);color:var(--dsw-alias-label-secondary)}
+.dak-audit th{font-weight:600;color:var(--dsw-alias-label-primary)}
+.dak-section{display:flex;flex-direction:column;gap:8px;padding:12px 14px;border:1px solid var(--dsw-alias-border-l1);border-radius:10px;background:var(--dsw-alias-bg-layer-2)}
 .dak-input{font:inherit;font-size:13px;min-width:0;flex:1 1 220px;padding:6px 10px;border-radius:8px;border:1px solid var(--dsw-alias-border-l2);background:var(--dsw-alias-bg-layer-2);color:var(--dsw-alias-label-primary);outline:none;box-sizing:border-box}
 .dak-input:focus-visible{border-color:var(--dsw-alias-brand-primary)}
 .dak-input::placeholder{color:var(--dsw-alias-label-secondary)}
@@ -287,18 +342,36 @@ window.__ModuleLoader__.load({
         h('div', { className: 'dak-row' },
           h('span', { className: 'dak-label' }, t('account.select')),
           h('div', { className: 'dak-chips' },
-            platform.accounts.map((account) => h('button', {
-              key: account.name,
-              className: 'dak-chip',
-              type: 'button',
-              'data-active': String(account.name === activeName),
-              'data-configured': String(account.configured === true),
-              title: account.configured ? `${account.name} · ${account.source}` : account.name,
-              onClick: () => { onSelectAccount(account.name); setLocalNote(null); setAdding(false); },
-            },
-            h('span', { className: 'dak-dot' }),
-            account.name,
-            account.isDefault ? ` · ${t('account.default')}` : '')),
+            platform.accounts.map((account) => {
+              // Health is advisory: it changes the tooltip and the dot colour,
+              // never whether the account can be picked.
+              const cooling = Number(account.cooldownMs ?? 0) > 0;
+              const health = cooling
+                ? t('health.cooldown', { s: Math.ceil(account.cooldownMs / 1000) })
+                : account.lastVerifyOk === true
+                  ? t('health.ok')
+                  : account.lastVerifyOk === false
+                    ? t('health.fail')
+                    : t('health.never');
+              const tip = account.configured
+                ? `${account.name} · ${account.source} · ${health}`
+                : `${account.name} · ${health}`;
+              return h('button', {
+                key: account.name,
+                className: 'dak-chip',
+                type: 'button',
+                'data-active': String(account.name === activeName),
+                'data-configured': String(account.configured === true),
+                'data-health': cooling ? 'cooldown' : account.lastVerifyOk === true ? 'ok'
+                  : account.lastVerifyOk === false ? 'fail' : 'unknown',
+                title: tip,
+                onClick: () => { onSelectAccount(account.name); setLocalNote(null); setAdding(false); },
+              },
+              h('span', { className: 'dak-dot' }),
+              account.name,
+              account.isDefault ? ` · ${t('account.default')}` : '',
+              cooling ? h('span', { className: 'dak-cool' }, '⏳') : null);
+            }),
             adding
               ? h('input', {
                 className: 'dak-input',
@@ -379,6 +452,9 @@ window.__ModuleLoader__.load({
       const [accountName, setAccountName] = React.useState(null);
       const [busy, setBusy] = React.useState('idle');
       const [note, setNote] = React.useState(null);
+      const [vaultPassword, setVaultPassword] = React.useState('');
+      const [vaultNote, setVaultNote] = React.useState(null);
+      const [auditView, setAuditView] = React.useState(null);
 
       const load = React.useCallback(async () => {
         const reply = await callBridge('status');
@@ -447,6 +523,42 @@ window.__ModuleLoader__.load({
           .finally(() => setBusy('idle'));
       };
 
+      /** Unlock the vault for this process. The password is not kept. */
+      const unlockVault = () => run('vault', async () => {
+        const reply = await callBridge('unlock', { password: vaultPassword });
+        setVaultPassword('');
+        if (reply.ok !== true) {
+          setVaultNote({ tone: 'error', text: reply.message || reply.code || t('vault.wrong') });
+          return;
+        }
+        setVaultNote({ tone: 'ok', text: t('vault.unlocked') });
+        await load();
+      });
+
+      /** Drop the decrypted keys immediately. */
+      const lockVault = () => run('vault', async () => {
+        const reply = await callBridge('lock', {});
+        if (reply.ok !== true) {
+          setVaultNote({ tone: 'error', text: reply.message || reply.code || 'failed' });
+          return;
+        }
+        setVaultNote(null);
+        setAuditView(null);
+        await load();
+      });
+
+      /** Load the audit trail, or hide it again. */
+      const toggleAudit = () => {
+        if (auditView !== null) { setAuditView(null); return; }
+        run('audit', async () => {
+          const reply = await callBridge('audit', { limit: 50 });
+          setAuditView(reply.ok === true ? reply.value : { error: reply.message || reply.code || 'failed' });
+        });
+      };
+
+      const vaultState = value.vault ?? { enabled: false, state: 'disabled' };
+      const auditState = value.audit ?? { enabled: false, entries: 0 };
+
       return h(
         'div',
         { className: 'dak-card' },
@@ -503,6 +615,52 @@ window.__ModuleLoader__.load({
 
         h('p', { className: 'dak-note' }, t('key.hint')),
 
+        // The vault is the one place a locked state must be loud: every call
+        // will fail until it is opened, and that looks like a broken plugin
+        // unless the reason is on screen.
+        vaultState.enabled === true
+          ? h('div', { className: 'dak-section' },
+            h('div', { className: 'dak-row' },
+              h('span', { className: 'dak-label' }, t('vault.title')),
+              h('span', {
+                className: 'dak-badge',
+                'data-on': String(vaultState.state === 'unlocked'),
+              }, vaultState.state === 'unlocked' ? t('vault.unlocked') : t('vault.locked'))),
+            vaultState.state === 'unlocked'
+              ? h('div', { className: 'dak-row' },
+                h('button', { className: 'dak-btn', type: 'button', disabled: busy !== 'idle', onClick: lockVault },
+                  t('vault.lock')))
+              : h('div', { className: 'dak-row' },
+                h('input', {
+                  className: 'dak-input',
+                  type: 'password',
+                  value: vaultPassword,
+                  placeholder: t('vault.password'),
+                  'aria-label': t('vault.password'),
+                  autoComplete: 'off',
+                  onChange: (event) => setVaultPassword(event.target.value),
+                  onKeyDown: (event) => { if (event.key === 'Enter') unlockVault(); },
+                }),
+                h('button', {
+                  className: 'dak-btn', 'data-kind': 'primary', type: 'button',
+                  disabled: busy !== 'idle' || vaultPassword.length === 0, onClick: unlockVault,
+                }, t('vault.unlock'))),
+            vaultNote === null
+              ? null
+              : h('p', {
+                className: 'dak-note',
+                'data-tone': vaultNote.tone === 'ok' ? 'ok' : 'error',
+              }, vaultNote.text),
+            vaultState.lastError !== undefined && vaultState.state !== 'unlocked'
+              ? h('p', { className: 'dak-note', 'data-tone': 'error' }, vaultState.lastError)
+              : null,
+            h('p', { className: 'dak-note' }, t('vault.hint')),
+            vaultState.passwordEnv
+              ? h('p', { className: 'dak-note' }, t('vault.envHint', { name: vaultState.passwordEnv }))
+              : null,
+            vaultState.file ? h('p', { className: 'dak-code' }, vaultState.file) : null)
+          : null,
+
         h('div', { className: 'dak-facts' },
           h('span', null, t('expose.title')),
           h('b', null, value.exposeKeys ? t('expose.on') : t('expose.off')),
@@ -514,7 +672,49 @@ window.__ModuleLoader__.load({
           h('ul', { className: 'dak-tools' },
             h('li', null, t('tools.call')),
             h('li', null, t('tools.platforms')),
-            h('li', null, t('tools.key')))),
+            h('li', null, t('tools.key')),
+            h('li', null, t('tools.upload')))),
+
+        // The audit trail is evidence, so the chain verdict is stated first:
+        // a list of entries with no verdict invites reading a tampered log as
+        // if it were trustworthy.
+        auditState.enabled === true
+          ? h('div', { className: 'dak-section' },
+            h('div', { className: 'dak-row' },
+              h('span', { className: 'dak-label' }, t('audit.title')),
+              h('span', { className: 'dak-badge' }, String(auditState.entries ?? 0)),
+              h('button', { className: 'dak-btn', type: 'button', disabled: busy !== 'idle', onClick: toggleAudit },
+                auditView === null ? t('audit.show') : t('audit.hide'))),
+            auditView === null
+              ? null
+              : auditView.error !== undefined
+                ? h('p', { className: 'dak-note', 'data-tone': 'error' }, auditView.error)
+                : h('div', null,
+                  h('p', {
+                    className: 'dak-note',
+                    'data-tone': auditView.chain && auditView.chain.ok ? 'ok' : 'error',
+                  }, auditView.chain && auditView.chain.ok
+                    ? t('audit.intact', { n: auditView.chain.entries })
+                    : t('audit.broken', { reason: (auditView.chain && auditView.chain.reason) || '?' })),
+                  auditView.entries && auditView.entries.length > 0
+                    ? h('div', { className: 'dak-audit' },
+                      h('table', null,
+                        h('thead', null, h('tr', null,
+                          h('th', null, '#'),
+                          h('th', null, 'when'),
+                          h('th', null, 'who'),
+                          h('th', null, 'what'),
+                          h('th', null, 'platform'),
+                          h('th', null, 'account'))),
+                        h('tbody', null, auditView.entries.map((entry) => h('tr', { key: entry.seq },
+                          h('td', null, String(entry.seq)),
+                          h('td', null, String(entry.at || '').replace('T', ' ').slice(0, 19)),
+                          h('td', null, String(entry.actor || '')),
+                          h('td', null, String(entry.action || '')),
+                          h('td', null, entry.platform === null ? '—' : String(entry.platform)),
+                          h('td', null, entry.account === null ? '—' : String(entry.account)))))))
+                    : h('p', { className: 'dak-note' }, t('audit.empty'))))
+          : null,
       );
     }
 

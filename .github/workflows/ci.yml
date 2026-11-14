@@ -66,8 +66,27 @@ jobs:
           console.log('icon ok,', Buffer.byteLength(svg), 'bytes');
           "
 
+      - name: Syntax check
+        run: |
+          node --check index.js
+          node --check client.js
+          node --check bin/cli.mjs
+          for file in lib/*.js; do node --check "$file"; done
+
+      - name: Security primitives
+        run: node dev/security-tests.mjs
+
+      - name: Integration checks
+        run: node dev/integration-tests.mjs
+
       - name: Client half checks
         run: node dev/client-smoke.mjs
+
+      - name: CLI smoke
+        run: |
+          node bin/cli.mjs status
+          node bin/cli.mjs list
+          node bin/cli.mjs audit --limit 5 || true
 
       - name: Scan for committed secrets
         run: |

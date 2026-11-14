@@ -197,15 +197,17 @@ apply(ctx, {
   requestTimeoutMs: 5000,
 });
 
-check(registered.length === 3, 'three tools registered');
+check(registered.length === 4, 'four tools registered');
 check(
-  registered.map((tool) => tool.name).join(',') === 'apikey_call,apikey_platforms,apikey_key',
+  registered.map((tool) => tool.name).join(',') === 'apikey_call,apikey_platforms,apikey_key,apikey_upload',
   'tool names',
 );
-check(routes.length === 6, 'six bridge routes');
+check(routes.length === 9, 'nine bridge routes');
 check(
   routes.map((route) => route.path).join(',')
-    === '/api/dsh-apikeys/status,/api/dsh-apikeys/add-account,/api/dsh-apikeys/remove-account,/api/dsh-apikeys/set,/api/dsh-apikeys/clear,/api/dsh-apikeys/verify',
+    === '/api/dsh-apikeys/status,/api/dsh-apikeys/add-account,/api/dsh-apikeys/remove-account,'
+      + '/api/dsh-apikeys/set,/api/dsh-apikeys/clear,/api/dsh-apikeys/verify,'
+      + '/api/dsh-apikeys/audit,/api/dsh-apikeys/unlock,/api/dsh-apikeys/lock',
   'bridge paths',
 );
 

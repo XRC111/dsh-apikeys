@@ -59,4 +59,32 @@
         maxResponseChars: 20000
         requestTimeoutMs: 30000
         userAgent: dsh-apikeys
+        # Optional layers. Every default below preserves the behaviour an
+        # existing install already has; nothing changes until you opt in.
+        vault:
+          enabled: false
+          file: ''
+          passwordEnv: DSH_APIKEYS_MASTER_PASSWORD
+          failClosed: true
+          migrateCredentials: true
+        audit:
+          enabled: true
+          file: ''
+          maxEntries: 2000
+        redact:
+          enabled: true
+          patterns: []
+          replaceWith: '[REDACTED]'
+        health:
+          file: ''
+        rotation:
+          enabled: false
+          retryOn: [401, 403, 429]
+          cooldownBaseMs: 5000
+          cooldownMaxMs: 300000
+          maxAttempts: 3
+        upload:
+          enabled: true
+          roots: []
+          maxFileBytes: 26214400
         migrateGitHub: true

@@ -14,11 +14,25 @@
  *
  * Every collaborator is a Cordis service resolved through the context, so the
  * bundle keeps loading across Harness versions that keep those seams. The one
- * import is `@deepseek-ai/schemastery`, because a plugin's `Config` has to be a
- * Schema: without it the Host cannot project a configuration form, and the
- * plugin's row on the Plugins page has no configure control.
+ * package import is `@deepseek-ai/schemastery`, because a plugin's `Config` has
+ * to be a Schema: without it the Host cannot project a configuration form, and
+ * the plugin's row on the Plugins page has no configure control.
+ *
+ * Optional layers, all off by default so an existing install keeps behaving
+ * exactly as it did:
+ *   - vault: encrypt the keys at rest, unlocked by a master password
+ *   - audit: a hash-chained record of who touched which account
+ *   - redact: strip credential-shaped strings from API responses
+ *   - rotation: fail over between accounts of one platform
  */
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import z from '@deepseek-ai/schemastery';
+import { createAuditLog } from './lib/audit.js';
+import { createRedactor } from './lib/redact.js';
+import { createHealthStore } from './lib/state.js';
+import { createVaultStore } from './lib/vault-store.js';
 
 const CREDENTIAL_SCOPE = 'dsh-apikeys';
 const BRIDGE_PREFIX = '/api/dsh-apikeys';
@@ -30,6 +44,30 @@ const ENV_NAME_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/;
 const DEFAULT_ACCOUNT = 'default';
 const METHODS = ['GET', 'POST', 'PATCH', 'PUT', 'DELETE', 'HEAD'];
 const MAX_REQUEST_BYTES = 64 * 1024;
+/** Statuses that mean "this credential will not work" rather than "this call is wrong". */
+const ROTATABLE_STATUSES = Object.freeze([401, 403, 429]);
+/** Default master password variable; a name, never the value. */
+const DEFAULT_PASSWORD_ENV = 'DSH_APIKEYS_MASTER_PASSWORD';
+
+/**
+ * Where the plugin keeps its own state.
+ *
+ * Everything is derived from `DSH_HOME` when it is set, so a profile's files
+ * live with that profile rather than in an unrelated home directory.
+ */
+function dataDir() {
+  const home = process.env.DSH_HOME;
+  if (typeof home === 'string' && home.length > 0) return path.join(home, 'dsh-apikeys');
+  return path.join(os.homedir(), '.dsh', 'dsh-apikeys');
+}
+
+/** Resolve a configured path, defaulting into the plugin's data directory. */
+function stateFilePath(configured, fallbackName) {
+  if (typeof configured === 'string' && configured.trim().length > 0) {
+    return path.resolve(configured.trim());
+  }
+  return path.join(dataDir(), fallbackName);
+}
 
 /**
  * Built-in platforms: where the API lives, how a key is presented, and how to
@@ -224,6 +262,58 @@ const Config = z.object({
   migrateGitHub: z.boolean().default(true).description(
     'Adopt keys the earlier github-only plugin left under dsh-github/<account>.',
   ),
+  vault: z.object({
+    enabled: z.boolean().default(false).description(
+      'Encrypt keys at rest behind a master password. Off by default: an existing install keeps its current behaviour.',
+    ),
+    file: z.string().default('').description('Vault file path. Empty uses the plugin data directory.'),
+    passwordEnv: z.string().default(DEFAULT_PASSWORD_ENV).description(
+      'Environment variable holding the master password. The value is never written to disk.',
+    ),
+    failClosed: z.boolean().default(true).description(
+      'When the vault cannot be unlocked, refuse calls that need a key. Off falls back to the credential store.',
+    ),
+    migrateCredentials: z.boolean().default(true).description(
+      'On unlock, move keys from the credential store into the vault and delete the plaintext records.',
+    ),
+  }).default({}).description('Optional at-rest encryption of stored keys.'),
+  audit: z.object({
+    enabled: z.boolean().default(true).description(
+      'Record who touched which account, without recording key values.',
+    ),
+    file: z.string().default('').description('Audit file path. Empty uses the plugin data directory.'),
+    maxEntries: z.number().default(2000).min(50).max(100000).description('Entries to keep.'),
+  }).default({}).description('Hash-chained audit log.'),
+  redact: z.object({
+    enabled: z.boolean().default(true).description(
+      'Replace credential-shaped strings in API responses before they reach the model.',
+    ),
+    patterns: z.array(z.string()).default([]).description(
+      'Extra regular expressions. Empty uses the built-in issuer patterns.',
+    ),
+    replaceWith: z.string().default('[REDACTED]').description('Replacement text.'),
+  }).default({}).description('Response redaction.'),
+  health: z.object({
+    file: z.string().default('').description(
+      'Where verification results are remembered. Empty uses the plugin data directory.',
+    ),
+  }).default({}).description('Persisted verify results.'),
+  rotation: z.object({
+    enabled: z.boolean().default(false).description(
+      'Fail over to another account of the same platform on a rejected credential. Off keeps accounts strictly isolated.',
+    ),
+    retryOn: z.array(z.number()).default([...ROTATABLE_STATUSES]).description('Statuses that trigger failover.'),
+    cooldownBaseMs: z.number().default(5000).min(100).max(3600000).description('First backoff interval.'),
+    cooldownMaxMs: z.number().default(300000).min(100).max(86400000).description('Backoff ceiling.'),
+    maxAttempts: z.number().default(3).min(1).max(10).description('Accounts tried per call.'),
+  }).default({}).description('Per-platform credential failover.'),
+  upload: z.object({
+    enabled: z.boolean().default(true).description('Allow apikey_upload to send a local file.'),
+    roots: z.array(z.string()).default([]).description(
+      'Directories a file may be read from. Empty allows only the working directory and your home directory.',
+    ),
+    maxFileBytes: z.number().default(26214400).min(1024).max(1073741824).description('Largest file sent.'),
+  }).default({}).description('Multipart upload support.'),
 });
 
 /** Read the row configuration with defaults and no schema dependency. */
@@ -258,6 +348,68 @@ function readConfig(raw) {
       ? config.userAgent.trim()
       : 'dsh-apikeys',
     migrateGitHub: config.migrateGitHub !== false,
+
+    // Every layer below defaults to the behaviour an existing install already
+    // has, so upgrading the plugin changes nothing until the user opts in.
+    vault: (() => {
+      const raw2 = asObject(config.vault);
+      return {
+        enabled: raw2.enabled === true,
+        file: stateFilePath(raw2.file, 'vault.json'),
+        passwordEnv: typeof raw2.passwordEnv === 'string' && ENV_NAME_PATTERN.test(raw2.passwordEnv.trim())
+          ? raw2.passwordEnv.trim()
+          : DEFAULT_PASSWORD_ENV,
+        failClosed: raw2.failClosed !== false,
+        migrateCredentials: raw2.migrateCredentials !== false,
+      };
+    })(),
+    audit: (() => {
+      const raw2 = asObject(config.audit);
+      return {
+        enabled: raw2.enabled !== false,
+        file: stateFilePath(raw2.file, 'audit.jsonl'),
+        maxEntries: clamp(toInteger(raw2.maxEntries, 2000), 50, 100000),
+      };
+    })(),
+    redact: (() => {
+      const raw2 = asObject(config.redact);
+      return {
+        enabled: raw2.enabled !== false,
+        patterns: Array.isArray(raw2.patterns)
+          ? raw2.patterns.map((entry) => String(entry)).filter((entry) => entry.length > 0)
+          : [],
+        replaceWith: typeof raw2.replaceWith === 'string' && raw2.replaceWith.length > 0
+          ? raw2.replaceWith
+          : '[REDACTED]',
+      };
+    })(),
+    health: {
+      file: stateFilePath(asObject(config.health).file, 'health.json'),
+    },
+    rotation: (() => {
+      const raw2 = asObject(config.rotation);
+      const retryOn = Array.isArray(raw2.retryOn)
+        ? raw2.retryOn.map((entry) => toInteger(entry, 0)).filter((entry) => entry >= 100 && entry < 600)
+        : [];
+      return {
+        enabled: raw2.enabled === true,
+        retryOn: retryOn.length > 0 ? retryOn : [...ROTATABLE_STATUSES],
+        cooldownBaseMs: clamp(toInteger(raw2.cooldownBaseMs, 5000), 100, 3600000),
+        cooldownMaxMs: clamp(toInteger(raw2.cooldownMaxMs, 300000), 100, 86400000),
+        maxAttempts: clamp(toInteger(raw2.maxAttempts, 3), 1, 10),
+      };
+    })(),
+    upload: (() => {
+      const raw2 = asObject(config.upload);
+      const roots = Array.isArray(raw2.roots)
+        ? raw2.roots.map((entry) => String(entry).trim()).filter((entry) => entry.length > 0)
+        : [];
+      return {
+        enabled: raw2.enabled !== false,
+        roots,
+        maxFileBytes: clamp(toInteger(raw2.maxFileBytes, 26214400), 1024, 1073741824),
+      };
+    })(),
   };
 }
 
@@ -367,15 +519,54 @@ function applyQueryAuth(platform, url, key) {
 }
 
 /**
+ * A URL that is safe to return or print.
+ *
+ * The `query` auth kind puts the credential in the URL itself, and the result
+ * carries that URL back to the model — which would hand over the key even with
+ * `exposeKeys: false`. Masking happens unconditionally here rather than through
+ * the redactor, because it must not depend on a setting the user can turn off.
+ */
+function describeUrl(url, key, replacement = '[REDACTED]') {
+  const rendered = url.toString();
+  if (typeof key !== 'string' || key.length === 0) return rendered;
+  return rendered.split(key).join(replacement).split(encodeURIComponent(key)).join(replacement);
+}
+
+/**
  * Resolve the key behind one account.
  *
- * A stored record always wins. Only the platform's default account may fall
- * back to the platform's environment reference, so a named account can never
- * silently inherit somebody else's credential.
- * @returns `{ key, source }`; `key` is `undefined` while unconfigured.
+ * Order matters and is deliberate:
+ *
+ *   1. **Vault** — when the vault is on and unlocked, it is the source of truth.
+ *      Its keys are the encrypted ones, so falling through on an empty vault
+ *      would silently resurrect a plaintext copy.
+ *   2. **Credential store** — the behaviour every existing install has, and the
+ *      only store when the vault is off.
+ *   3. **Environment** — only for a platform's default account, so a named
+ *      account can never inherit somebody else's credential.
+ *
+ * A locked vault with `failClosed` refuses rather than falling through: silently
+ * using a plaintext record is exactly the leak the vault exists to prevent.
+ * @returns `{ key, source, error? }`; `key` is `undefined` while unconfigured.
  */
-async function accountKey(ctx, config, platform, account) {
-  const credentials = ctx.get('credentials');
+async function accountKey(runtime, platform, account) {
+  const { config, vault } = runtime;
+
+  if (vault !== undefined && vault.enabled) {
+    if (vault.state === 'unlocked') {
+      const stored = vault.get(platform.id, account);
+      if (stored !== undefined) return { key: stored, source: 'vault' };
+    } else if (config.vault.failClosed) {
+      return {
+        key: undefined,
+        source: 'vault-locked',
+        error: `the vault is locked${vault.lastError === undefined ? '' : ` (${vault.lastError})`}; `
+          + 'set the master password or turn vault.failClosed off to fall back',
+      };
+    }
+  }
+
+  const credentials = runtime.ctx.get('credentials');
   if (credentials === undefined) return { key: undefined, source: 'unavailable' };
 
   const record = await credentials.readRecord(`${CREDENTIAL_SCOPE}/${recordId(platform.id, account)}`);
@@ -396,29 +587,43 @@ async function accountKey(ctx, config, platform, account) {
 }
 
 /** Store or replace one account key. */
-async function storeKey(ctx, platform, account, key) {
-  const credentials = ctx.get('credentials');
+async function storeKey(runtime, platform, account, key) {
+  const { vault, config } = runtime;
+  if (vault !== undefined && vault.enabled && vault.state === 'unlocked') {
+    vault.set(platform.id, account, key);
+    return 'vault';
+  }
+  const credentials = runtime.ctx.get('credentials');
   if (credentials === undefined) {
-    throw new Error('this profile has no credentials service, so keys cannot be stored here');
+    throw new Error(config.vault.enabled
+      ? 'the vault is locked and this profile has no credentials service, so the key cannot be stored'
+      : 'this profile has no credentials service, so keys cannot be stored here');
   }
   await credentials.modifyRecord(
     `${CREDENTIAL_SCOPE}/${recordId(platform.id, account)}`,
     async () => ({ kind: 'api-key', key }),
   );
+  return 'stored';
 }
 
-/** Remove one stored account key. Removing an absent record is a no-op. */
-async function removeKey(ctx, platform, account) {
-  const credentials = ctx.get('credentials');
-  if (credentials === undefined) {
-    throw new Error('this profile has no credentials service, so there is nothing to remove');
+/** Remove one stored account key from every store it could be in. */
+async function removeKey(runtime, platform, account) {
+  let removed = false;
+  const { vault } = runtime;
+  if (vault !== undefined && vault.enabled && vault.state === 'unlocked') {
+    removed = vault.remove(platform.id, account) || removed;
   }
-  await credentials.deleteRecord(`${CREDENTIAL_SCOPE}/${recordId(platform.id, account)}`);
+  const credentials = runtime.ctx.get('credentials');
+  if (credentials !== undefined) {
+    await credentials.deleteRecord(`${CREDENTIAL_SCOPE}/${recordId(platform.id, account)}`);
+  }
+  return removed;
 }
 
 /** Every account stored for one platform, with state and no values. */
-async function listAccounts(ctx, config, platform, declaredAccounts) {
-  const credentials = ctx.get('credentials');
+async function listAccounts(runtime, platform) {
+  const { config, vault, declaredAccounts, health } = runtime;
+  const credentials = runtime.ctx.get('credentials');
   const names = new Set([config.defaultAccount]);
   for (const declared of config.accounts) {
     if (declared.platform === platform.id) names.add(declared.name);
@@ -427,8 +632,14 @@ async function listAccounts(ctx, config, platform, declaredAccounts) {
   for (const declared of declaredAccounts ?? []) {
     if (declared.platform === platform.id) names.add(declared.name);
   }
-  const prefix = `${CREDENTIAL_SCOPE}/${platform.id}-`;
 
+  if (vault !== undefined && vault.enabled && vault.state === 'unlocked') {
+    for (const entry of vault.list()) {
+      if (entry.platform === platform.id) names.add(entry.account);
+    }
+  }
+
+  const prefix = `${CREDENTIAL_SCOPE}/${platform.id}-`;
   if (credentials !== undefined) {
     for (const entry of await credentials.listRecords()) {
       const key = String(entry?.key ?? '');
@@ -440,12 +651,20 @@ async function listAccounts(ctx, config, platform, declaredAccounts) {
 
   const accounts = [];
   for (const name of [...names].sort((left, right) => left.localeCompare(right))) {
-    const credential = await accountKey(ctx, config, platform, name);
+    const credential = await accountKey(runtime, platform, name);
+    const verification = health?.verification(platform.id, name);
+    const cooldownMs = health?.cooldownRemaining(platform.id, name) ?? 0;
     accounts.push({
       name,
       configured: credential.key !== undefined,
       source: credential.source,
       isDefault: name === config.defaultAccount,
+      ...(verification === undefined ? {} : {
+        lastVerifiedAt: verification.at,
+        lastVerifyOk: verification.ok,
+        ...(verification.identity === undefined ? {} : { lastVerifyIdentity: verification.identity }),
+      }),
+      ...(cooldownMs > 0 ? { cooldownMs } : {}),
     });
   }
   return accounts;
@@ -518,11 +737,33 @@ function readRateLimit(headers) {
   };
 }
 
+/**
+ * The proxy variables present in this process, if any.
+ *
+ * Named rather than valued: the point of the hint is to tell the user which knob
+ * the runtime might be reading, not to echo their configuration back.
+ */
+function proxyVariables() {
+  const names = ['HTTPS_PROXY', 'https_proxy', 'HTTP_PROXY', 'http_proxy', 'NO_PROXY', 'no_proxy'];
+  return names.filter((name) => {
+    const value = process.env[name];
+    return typeof value === 'string' && value.length > 0;
+  });
+}
+
 /** One line of guidance for a failed request, when a status suggests one. */
 function hintFor(status, remaining, transport) {
   if (status === 0) {
+    const proxies = proxyVariables();
+    // Node's fetch ignores the proxy environment unless the runtime opts in, so
+    // a proxy-only network fails here with no obvious cause. Naming the
+    // variables and the switch turns a mystery into a one-line fix.
+    const proxyNote = proxies.length === 0
+      ? ''
+      : ` — ${proxies.join('/')} ${proxies.length === 1 ? 'is' : 'are'} set but Node's fetch only honours `
+        + 'them with NODE_USE_ENV_PROXY=1 or node --use-env-proxy';
     return `the request never reached the server${typeof transport === 'string' ? ` (${transport})` : ''}; `
-      + 'check this machine\'s network and any proxy in the launch environment';
+      + `check this machine's network${proxyNote}`;
   }
   if (status === 401) return 'the key is missing, expired, or revoked; check the account and store a new one';
   if (status === 403 && remaining === 0) return 'the rate limit is exhausted; wait until reset or use another account';
@@ -644,10 +885,28 @@ const CALL_OUTPUT_SCHEMA = {
     account: { type: 'string', description: 'Credential account that authorized the call.' },
     credentialSource: {
       type: 'string',
-      description: '`stored`, an environment source name, `unset` (anonymous call) or `unavailable`.',
+      description: '`vault`, `stored`, an environment source name, `unset` (anonymous call) or `unavailable`.',
     },
     truncated: { type: 'boolean', description: 'Whether the response body was cut to the configured limit.' },
     data: { description: 'Parsed JSON body, or raw text when the body is not JSON.' },
+    rotated: {
+      type: 'integer',
+      description: 'How many credentials were tried before this answer, when rotation is on.',
+    },
+    uploaded: {
+      type: 'array',
+      description: 'Files sent with this request, as field name and byte count.',
+      items: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          field: { type: 'string' },
+          filename: { type: 'string' },
+          bytes: { type: 'integer' },
+        },
+        required: ['field', 'filename', 'bytes'],
+      },
+    },
     rateLimit: {
       type: 'object',
       additionalProperties: false,
@@ -788,12 +1047,216 @@ function renderKey(_args, value) {
 }
 
 /**
- * Register the three tools in the scope that resolved the `tools` service.
- * @param ctx - context owning `tools` and `credentials`.
- * @param config - normalized row configuration.
- * @param platforms - resolved platform map.
+ * Candidate accounts for one call, in the order to try them.
+ *
+ * With rotation off this is exactly the requested account — accounts stay
+ * isolated, which is the default and the behaviour every existing install has.
+ *
+ * With rotation on, accounts that are cooling down go last: the point of the
+ * backoff is to stop hammering a credential the platform just rejected, so
+ * retrying it first would waste the very attempt the cooldown exists to avoid.
+ * It is still never dropped entirely — if every account is cooling, the
+ * requested one is tried rather than failing without asking anyone.
  */
-function registerTools(ctx, config, platforms, declaredAccounts) {
+async function callCandidates(runtime, platform, requested) {
+  const { config } = runtime;
+  if (config.rotation.enabled !== true) return [requested];
+
+  const accounts = await listAccounts(runtime, platform);
+  const configured = accounts.filter((account) => account.configured === true);
+  const healthy = configured.filter((account) => (account.cooldownMs ?? 0) === 0);
+  const cooling = configured.filter((account) => (account.cooldownMs ?? 0) > 0);
+
+  const ordered = [];
+  const requestedEntry = accounts.find((account) => account.name === requested);
+  const requestedIsCooling = (requestedEntry?.cooldownMs ?? 0) > 0;
+
+  // The requested account leads when it is usable; otherwise the healthy pool
+  // leads and it is held back as a last resort.
+  if (!requestedIsCooling) ordered.push(requested);
+  for (const account of healthy) {
+    if (account.name === requested) continue;
+    ordered.push(account.name);
+  }
+  for (const account of cooling) {
+    if (account.name === requested) continue;
+    ordered.push(account.name);
+  }
+  if (requestedIsCooling) ordered.push(requested);
+
+  const unique = [...new Set(ordered)].slice(0, config.rotation.maxAttempts);
+  return unique.length > 0 ? unique : [requested];
+}
+
+/**
+ * Perform one platform request, selecting and failing over between credentials.
+ *
+ * Every branch that could leak the key is handled here rather than in the tool:
+ * the response body is redacted before it becomes a result, and the audit log
+ * records the attempt without recording the key.
+ */
+async function performCall(runtime, options) {
+  const { config, platforms, health, redactor, audit } = runtime;
+  const platform = platforms.get(options.platform);
+  const candidates = await callCandidates(runtime, platform, options.account);
+  const attempts = [];
+  let last;
+
+  for (let index = 0; index < candidates.length; index += 1) {
+    const account = candidates[index];
+    const credential = await accountKey(runtime, platform, account);
+    if (credential.error !== undefined) throw new Error(credential.error);
+
+    const url = buildUrl(platform, options.path, options.query);
+    if (credential.key !== undefined) applyQueryAuth(platform, url, credential.key);
+    const headers = credential.key === undefined
+      ? { 'user-agent': config.userAgent, ...(platform.headers ?? {}) }
+      : { 'user-agent': config.userAgent, ...authHeaders(platform, credential.key) };
+
+    const response = await platformRequest(config, platform, {
+      url,
+      method: options.method,
+      headers: {
+        ...headers,
+        ...(options.body === undefined ? {} : { 'content-type': 'application/json' }),
+      },
+      body: options.body,
+      signal: options.signal,
+    });
+
+    // Redact against the exact key this attempt used: that is the one an
+    // unhelpful error message would echo back.
+    const data = redactor.redactValue(response.data, credential.key === undefined ? [] : [credential.key]);
+    const attempt = {
+      account,
+      status: response.status,
+      ok: response.ok,
+      credentialSource: credential.key === undefined ? 'unset' : credential.source,
+      ...(response.transport === undefined ? {} : { transport: response.transport }),
+    };
+    attempts.push(attempt);
+
+    last = { url, account, credential, response, data };
+
+    const rotatable = config.rotation.retryOn.includes(response.status);
+    const more = index < candidates.length - 1;
+    if (response.ok || !rotatable || !more) break;
+
+    // This credential is not usable right now; back it off and try the next.
+    health.markFailure(platform.id, account, {
+      baseMs: config.rotation.cooldownBaseMs,
+      maxMs: config.rotation.cooldownMaxMs,
+    });
+  }
+
+  if (last === undefined) {
+    // Every candidate was unconfigured. Still do the anonymous request so a
+    // public endpoint keeps working, exactly as before.
+    const url = buildUrl(platform, options.path, options.query);
+    const response = await platformRequest(config, platform, {
+      url,
+      method: options.method,
+      headers: { 'user-agent': config.userAgent, ...(platform.headers ?? {}) },
+      body: options.body,
+      signal: options.signal,
+    });
+    last = {
+      url,
+      account: options.account,
+      credential: { key: undefined, source: 'unset' },
+      response,
+      data: redactor.redactValue(response.data, []),
+    };
+  }
+
+  const { url, account, credential, response, data } = last;
+  if (response.ok) health.markSuccess(platform.id, account);
+
+  audit?.append({
+    actor: options.actor ?? 'tool',
+    action: 'call',
+    platform: platform.id,
+    account,
+    detail: {
+      method: options.method,
+      path: options.path,
+      status: response.status,
+      attempts: attempts.length > 1 ? attempts : undefined,
+      redacted: data !== response.data ? true : undefined,
+    },
+  });
+
+  const hint = response.ok
+    ? undefined
+    : hintFor(response.status, response.rateLimit?.remaining, response.transport);
+
+  return {
+    ok: response.ok,
+    status: response.status,
+    platform: platform.id,
+    method: options.method,
+    url: describeUrl(url, credential.key),
+    account,
+    credentialSource: credential.key === undefined ? 'unset' : credential.source,
+    truncated: response.truncated,
+    data,
+    ...(attempts.length > 1 ? { rotated: attempts.length } : {}),
+    ...(response.rateLimit === undefined ? {} : { rateLimit: response.rateLimit }),
+    ...(response.pagination === undefined ? {} : { pagination: response.pagination }),
+    ...(hint === undefined ? {} : { hint }),
+    ...(response.transport === undefined ? {} : { transport: response.transport }),
+  };
+}
+
+/**
+ * Resolve one upload path, refusing anything outside the allowed roots.
+ *
+ * A model that can name any absolute path could send `/etc/shadow` or an SSH
+ * key to a third party. The allowlist is what makes an upload tool safe to
+ * expose at all: it can only reach files the operator already placed somewhere
+ * the plugin is willing to read.
+ */
+async function resolveUploadFile(config, requested) {
+  if (typeof requested !== 'string' || requested.trim().length === 0) {
+    throw new Error('apikey_upload requires a file "path"');
+  }
+  const resolved = path.resolve(requested.trim());
+  const roots = config.upload.roots.length > 0
+    ? config.upload.roots.map((root) => path.resolve(root))
+    : [process.cwd(), os.homedir()];
+
+  const allowed = roots.some((root) => {
+    const relative = path.relative(root, resolved);
+    return relative.length > 0 && !relative.startsWith('..') && !path.isAbsolute(relative);
+  });
+  if (!allowed) {
+    throw new Error(
+      `apikey_upload refused ${resolved}: it is outside the allowed roots (${roots.join(', ')}). `
+      + 'List a directory in upload.roots to permit it.',
+    );
+  }
+
+  let info;
+  try {
+    info = await fs.promises.stat(resolved);
+  } catch {
+    throw new Error(`apikey_upload cannot read ${resolved}`);
+  }
+  if (!info.isFile()) throw new Error(`apikey_upload needs a file, not something else: ${resolved}`);
+  if (info.size > config.upload.maxFileBytes) {
+    throw new Error(
+      `apikey_upload: ${resolved} is ${info.size} bytes, over the ${config.upload.maxFileBytes}-byte limit`,
+    );
+  }
+  return { path: resolved, size: info.size, bytes: await fs.promises.readFile(resolved) };
+}
+
+/**
+ * Register the tools in the scope that resolved the `tools` service.
+ * @param runtime - shared plugin state: ctx, config, platforms, and the optional layers.
+ */
+function registerTools(runtime) {
+  const { ctx, config, platforms, audit, redactor, health } = runtime;
   const platformIds = [...platforms.keys()];
 
   ctx.tools.register({
@@ -881,47 +1344,20 @@ function registerTools(ctx, config, platforms, declaredAccounts) {
         }
       }
 
-      const url = buildUrl(platform, path, input.query);
-      const credential = await accountKey(ctx, config, platform, account);
-      if (credential.key !== undefined) applyQueryAuth(platform, url, credential.key);
-
-      const headers = credential.key === undefined
-        ? { 'user-agent': config.userAgent, ...(platform.headers ?? {}) }
-        : { 'user-agent': config.userAgent, ...authHeaders(platform, credential.key) };
-
       const body = input.body !== undefined && (method === 'POST' || method === 'PATCH' || method === 'PUT' || method === 'DELETE')
         ? JSON.stringify(input.body)
         : undefined;
 
-      const response = await platformRequest(config, platform, {
-        url,
-        method,
-        headers: {
-          ...headers,
-          ...(body === undefined ? {} : { 'content-type': 'application/json' }),
-        },
-        body,
-        signal: exec.signal,
-      });
-
-      const hint = response.ok
-        ? undefined
-        : hintFor(response.status, response.rateLimit?.remaining, response.transport);
-      return {
-        ok: response.ok,
-        status: response.status,
+      return performCall(runtime, {
         platform: platformId,
         method,
-        url: url.toString(),
+        path,
+        query: input.query,
+        body,
         account,
-        credentialSource: credential.key === undefined ? 'unset' : credential.source,
-        truncated: response.truncated,
-        data: response.data,
-        ...(response.rateLimit === undefined ? {} : { rateLimit: response.rateLimit }),
-        ...(response.pagination === undefined ? {} : { pagination: response.pagination }),
-        ...(hint === undefined ? {} : { hint }),
-        ...(response.transport === undefined ? {} : { transport: response.transport }),
-      };
+        signal: exec.signal,
+        actor: 'tool:apikey_call',
+      });
     },
   });
 
@@ -942,7 +1378,7 @@ function registerTools(ctx, config, platforms, declaredAccounts) {
           label: platform.label,
           baseUrl: platform.baseUrl,
           custom: platform.custom === true,
-          accounts: await listAccounts(ctx, config, platform, declaredAccounts),
+          accounts: await listAccounts(runtime, platform),
         });
       }
       return {
@@ -1017,7 +1453,12 @@ function registerTools(ctx, config, platforms, declaredAccounts) {
           );
         }
         if (exec.signal !== undefined && exec.signal.aborted) throw new Error('apikey_key was cancelled');
-        const credential = await accountKey(ctx, config, platform, account);
+        const credential = await accountKey(runtime, platform, account);
+        if (credential.error !== undefined) throw new Error(credential.error);
+        audit?.append({
+          actor: 'tool:apikey_key', action: 'key.get',
+          platform: platform.id, account, detail: { ok: credential.key !== undefined },
+        });
         if (credential.key === undefined) {
           return {
             ok: false,
@@ -1044,12 +1485,17 @@ function registerTools(ctx, config, platforms, declaredAccounts) {
         const value = typeof input.value === 'string' ? input.value.trim() : '';
         if (value.length === 0) throw new Error('apikey_key action "set" requires a non-empty "value"');
         if (value.length > 8192) throw new Error('apikey_key "value" is longer than any API key');
-        await storeKey(ctx, platform, account, value);
-        return { ok: true, action, platform: platform.id, account, configured: true, source: 'stored' };
+        const where = await storeKey(runtime, platform, account, value);
+        audit?.append({
+          actor: 'tool:apikey_key', action: 'key.set',
+          platform: platform.id, account, detail: { store: where },
+        });
+        return { ok: true, action, platform: platform.id, account, configured: true, source: where };
       }
 
-      await removeKey(ctx, platform, account);
-      const remaining = await accountKey(ctx, config, platform, account);
+      await removeKey(runtime, platform, account);
+      audit?.append({ actor: 'tool:apikey_key', action: 'key.clear', platform: platform.id, account });
+      const remaining = await accountKey(runtime, platform, account);
       return {
         ok: true,
         action,
@@ -1057,6 +1503,162 @@ function registerTools(ctx, config, platforms, declaredAccounts) {
         account,
         configured: remaining.key !== undefined,
         source: remaining.source,
+      };
+    },
+  });
+
+  ctx.tools.register({
+    name: 'apikey_upload',
+    description:
+      'Send a multipart/form-data request to one of the configured platforms, reading the file from this '
+      + 'machine. Use it for endpoints that take a file rather than JSON — Hugging Face model uploads, '
+      + 'GitHub release assets, artifact stores. The key stays on the Host: only the path is yours, the '
+      + 'credential is attached here. Paths must sit under upload.roots (the working directory and your '
+      + `home directory by default). Available platforms: ${platformIds.join(', ')}.`,
+    parameters: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        platform: { type: 'string', description: `Platform id. One of: ${platformIds.join(', ')}.` },
+        path: {
+          type: 'string',
+          description: 'Path on the platform\'s API host, starting with "/". Absolute URLs are refused.',
+        },
+        method: {
+          type: 'string',
+          enum: ['POST', 'PUT', 'PATCH'],
+          default: 'POST',
+          description: 'HTTP method. Most upload endpoints take POST or PUT.',
+        },
+        account: { type: 'string', description: 'Named credential account. Defaults to the default account.' },
+        fields: {
+          type: 'object',
+          additionalProperties: true,
+          description: 'Plain form fields sent alongside the files, as name/value pairs.',
+        },
+        files: {
+          type: 'array',
+          description: 'Files to send, in order.',
+          items: {
+            type: 'object',
+            additionalProperties: false,
+            properties: {
+              field: { type: 'string', description: 'Form field name, for example "file".' },
+              path: { type: 'string', description: 'Local file path on this machine.' },
+              filename: { type: 'string', description: 'Filename to present. Defaults to the basename.' },
+              contentType: { type: 'string', description: 'MIME type. Defaults to application/octet-stream.' },
+            },
+            required: ['field', 'path'],
+          },
+        },
+        query: {
+          type: 'object',
+          additionalProperties: true,
+          description: 'Query string parameters as name/value pairs.',
+        },
+      },
+      required: ['platform', 'path', 'files'],
+    },
+    output: { schema: CALL_OUTPUT_SCHEMA, render: renderCall },
+    async execute(args, exec) {
+      const input = asObject(args);
+      if (config.upload.enabled !== true) {
+        throw new Error('apikey_upload is turned off: set upload.enabled to true to allow file uploads');
+      }
+      const platformId = normalizeLooseName(input.platform);
+      const platform = platformId === undefined ? undefined : platforms.get(platformId);
+      if (platform === undefined) {
+        throw new Error(`apikey_upload "platform" must be one of: ${platformIds.join(', ')}`);
+      }
+      const method = typeof input.method === 'string' ? input.method.trim().toUpperCase() : 'POST';
+      if (!['POST', 'PUT', 'PATCH'].includes(method)) {
+        throw new Error('apikey_upload "method" must be POST, PUT or PATCH');
+      }
+      const path2 = typeof input.path === 'string' ? input.path.trim() : '';
+      if (!path2.startsWith('/') || path2.startsWith('//') || /^[A-Za-z][A-Za-z0-9+.-]*:/u.test(path2)) {
+        throw new Error(`apikey_upload "path" must be a path on ${platformId}'s host, starting with "/"`);
+      }
+      const account = input.account === undefined || input.account === null || input.account === ''
+        ? config.defaultAccount
+        : normalizeAccountName(input.account);
+      if (account === undefined) {
+        throw new Error('apikey_upload "account" must be lowercase letters and digits, starting with a letter');
+      }
+      const requested = Array.isArray(input.files) ? input.files : [];
+      if (requested.length === 0) throw new Error('apikey_upload requires at least one file');
+
+      const files = [];
+      const uploaded = [];
+      for (const entry of requested) {
+        const row = asObject(entry);
+        const field = typeof row.field === 'string' ? row.field.trim() : '';
+        if (field.length === 0) throw new Error('apikey_upload: every file needs a "field" name');
+        const resolved = await resolveUploadFile(config, row.path);
+        const filename = typeof row.filename === 'string' && row.filename.length > 0
+          ? row.filename
+          : path.basename(resolved.path);
+        const contentType = typeof row.contentType === 'string' && row.contentType.length > 0
+          ? row.contentType
+          : 'application/octet-stream';
+        files.push({ field, filename, contentType, bytes: resolved.bytes });
+        uploaded.push({ field, filename, bytes: resolved.size });
+      }
+
+      const credential = await accountKey(runtime, platform, account);
+      if (credential.error !== undefined) throw new Error(credential.error);
+
+      const url = buildUrl(platform, path2, input.query);
+      if (credential.key !== undefined) applyQueryAuth(platform, url, credential.key);
+
+      // FormData sets its own boundary; setting content-type by hand would
+      // break the request, so only the auth headers are merged here.
+      const form = new FormData();
+      for (const [name, value] of Object.entries(asObject(input.fields))) {
+        if (value === undefined || value === null) continue;
+        form.append(name, typeof value === 'object' ? JSON.stringify(value) : String(value));
+      }
+      for (const file of files) {
+        form.append(file.field, new Blob([file.bytes], { type: file.contentType }), file.filename);
+      }
+
+      const headers = credential.key === undefined
+        ? { 'user-agent': config.userAgent, ...(platform.headers ?? {}) }
+        : { 'user-agent': config.userAgent, ...authHeaders(platform, credential.key) };
+
+      const response = await platformRequest(config, platform, {
+        url, method, headers, body: form, signal: exec.signal,
+      });
+      const data = redactor.redactValue(response.data, credential.key === undefined ? [] : [credential.key]);
+      if (response.ok) health.markSuccess(platform.id, account);
+
+      const totalBytes = uploaded.reduce((sum, file) => sum + file.bytes, 0);
+      audit?.append({
+        actor: 'tool:apikey_upload', action: 'call', platform: platform.id, account,
+        detail: {
+          method, path: path2, status: response.status,
+          files: uploaded.map((file) => ({ filename: file.filename, bytes: file.bytes })),
+          totalBytes,
+        },
+      });
+
+      const hint = response.ok
+        ? undefined
+        : hintFor(response.status, response.rateLimit?.remaining, response.transport);
+      return {
+        ok: response.ok,
+        status: response.status,
+        platform: platform.id,
+        method,
+        url: describeUrl(url, credential.key),
+        account,
+        credentialSource: credential.key === undefined ? 'unset' : credential.source,
+        truncated: response.truncated,
+        data,
+        uploaded,
+        ...(response.rateLimit === undefined ? {} : { rateLimit: response.rateLimit }),
+        ...(response.pagination === undefined ? {} : { pagination: response.pagination }),
+        ...(hint === undefined ? {} : { hint }),
+        ...(response.transport === undefined ? {} : { transport: response.transport }),
       };
     },
   });
@@ -1127,7 +1729,8 @@ async function readJson(request) {
 }
 
 /** The bridge surface the Client page uses. */
-function createBridge(ctx, config, platforms, trust, declaredAccounts) {
+function createBridge(runtime, trust) {
+  const { ctx, config, platforms, audit, health } = runtime;
   const status = async () => {
     const rows = [];
     for (const platform of platforms.values()) {
@@ -1140,7 +1743,7 @@ function createBridge(ctx, config, platforms, trust, declaredAccounts) {
         hint: platform.hint,
         note: platform.note,
         envName: platform.envName,
-        accounts: await listAccounts(ctx, config, platform, declaredAccounts),
+        accounts: await listAccounts(runtime, platform),
       });
     }
     return {
@@ -1150,6 +1753,32 @@ function createBridge(ctx, config, platforms, trust, declaredAccounts) {
       envFallback: config.envFallback,
       exposeKeys: config.exposeKeys,
       storeAvailable: ctx.get('credentials') !== undefined,
+      // The settings page shows these so a locked vault or a cooling account is
+      // visible rather than looking like a broken plugin.
+      vault: {
+        enabled: config.vault.enabled,
+        state: runtime.vault?.state ?? 'disabled',
+        file: config.vault.enabled ? config.vault.file : undefined,
+        failClosed: config.vault.failClosed,
+        passwordEnv: config.vault.passwordEnv,
+        lastError: runtime.vault?.lastError,
+      },
+      rotation: {
+        enabled: config.rotation.enabled,
+        retryOn: config.rotation.retryOn,
+        cooldowns: health.cooldowns(),
+      },
+      redact: { enabled: config.redact.enabled },
+      audit: {
+        enabled: config.audit.enabled,
+        entries: audit?.size() ?? 0,
+        file: config.audit.enabled ? config.audit.file : undefined,
+      },
+      upload: {
+        enabled: config.upload.enabled,
+        roots: config.upload.roots.length > 0 ? config.upload.roots : [process.cwd(), os.homedir()],
+        maxFileBytes: config.upload.maxFileBytes,
+      },
     };
   };
 
@@ -1176,7 +1805,8 @@ function createBridge(ctx, config, platforms, trust, declaredAccounts) {
       const key = typeof body.token === 'string' ? body.token.trim() : '';
       if (key.length === 0) return { ok: false, code: 'empty-token', message: 'the key is empty' };
       if (key.length > 8192) return { ok: false, code: 'long-token', message: 'the key is longer than any API key' };
-      await storeKey(ctx, platform, account, key);
+      const where = await storeKey(runtime, platform, account, key);
+      audit?.append({ actor: "user", action: "key.set", platform: platform.id, account, detail: { store: where } });
       return { ok: true, value: await status() };
     },
 
@@ -1188,14 +1818,15 @@ function createBridge(ctx, config, platforms, trust, declaredAccounts) {
       if (account === undefined) {
         return { ok: false, code: 'invalid-account', message: 'account must be lowercase letters and digits' };
       }
-      await removeKey(ctx, platform, account);
+      await removeKey(runtime, platform, account);
+      audit?.append({ actor: "user", action: "key.clear", platform: platform.id, account });
       // Clearing a key is how a user retires an account. Drop the registration
       // too, or the name stays visible with no key and looks like an account
       // still waiting to be filled in.
-      const index = declaredAccounts.findIndex(
+      const index = runtime.declaredAccounts.findIndex(
         (row) => row.platform === platform.id && row.name === account,
       );
-      if (index >= 0) declaredAccounts.splice(index, 1);
+      if (index >= 0) runtime.declaredAccounts.splice(index, 1);
       return { ok: true, value: await status() };
     },
 
@@ -1222,11 +1853,12 @@ function createBridge(ctx, config, platforms, trust, declaredAccounts) {
           message: `"${account}" is this platform's default account and cannot be removed; it is what unnamed calls fall back to`,
         };
       }
-      await removeKey(ctx, platform, account);
-      const index = declaredAccounts.findIndex(
+      await removeKey(runtime, platform, account);
+      audit?.append({ actor: "user", action: "key.clear", platform: platform.id, account });
+      const index = runtime.declaredAccounts.findIndex(
         (row) => row.platform === platform.id && row.name === account,
       );
-      if (index >= 0) declaredAccounts.splice(index, 1);
+      if (index >= 0) runtime.declaredAccounts.splice(index, 1);
       return { ok: true, value: await status() };
     },
 
@@ -1246,8 +1878,8 @@ function createBridge(ctx, config, platforms, trust, declaredAccounts) {
       if (account === undefined) {
         return { ok: false, code: 'invalid-account', message: 'account must be lowercase letters and digits, at most 32' };
       }
-      if (!declaredAccounts.some((row) => row.platform === platform.id && row.name === account)) {
-        declaredAccounts.push({ platform: platform.id, name: account });
+      if (!runtime.declaredAccounts.some((row) => row.platform === platform.id && row.name === account)) {
+        runtime.declaredAccounts.push({ platform: platform.id, name: account });
       }
       return { ok: true, value: await status() };
     },
@@ -1264,7 +1896,10 @@ function createBridge(ctx, config, platforms, trust, declaredAccounts) {
         return { ok: false, code: 'no-verify', message: 'this platform does not declare a verification endpoint' };
       }
 
-      const credential = await accountKey(ctx, config, platform, account);
+      const credential = await accountKey(runtime, platform, account);
+      if (credential.error !== undefined) {
+        return { ok: false, code: 'vault-locked', message: credential.error };
+      }
       if (credential.key === undefined) {
         return { ok: false, code: 'no-token', message: `no key is stored for "${account}"` };
       }
@@ -1278,13 +1913,25 @@ function createBridge(ctx, config, platforms, trust, declaredAccounts) {
       });
 
       if (!response.ok) {
-        return {
-          ok: false,
-          code: `${platform.id}-${response.status}`,
-          message: hintFor(response.status, response.rateLimit?.remaining, response.transport)
-            ?? `${platform.label} answered ${response.status}`,
-        };
+        const message = hintFor(response.status, response.rateLimit?.remaining, response.transport)
+          ?? `${platform.label} answered ${response.status}`;
+        // A verify is the user asking "does this still work", so remember the
+        // answer: the badge should not go stale the moment the page reloads.
+        health.recordVerification(platform.id, account, { ok: false, status: response.status, message });
+        audit?.append({
+          actor: 'user', action: 'verify', platform: platform.id, account,
+          detail: { ok: false, status: response.status },
+        });
+        return { ok: false, code: `${platform.id}-${response.status}`, message };
       }
+
+      const identity = readPath(response.data, platform.verify.identity);
+      health.recordVerification(platform.id, account, { ok: true, status: response.status, identity });
+      health.markSuccess(platform.id, account);
+      audit?.append({
+        actor: 'user', action: 'verify', platform: platform.id, account,
+        detail: { ok: true, status: response.status, identity: identity ?? null },
+      });
 
       return {
         ok: true,
@@ -1292,10 +1939,60 @@ function createBridge(ctx, config, platforms, trust, declaredAccounts) {
           platform: platform.id,
           account,
           source: credential.source,
-          identity: readPath(response.data, platform.verify.identity),
+          identity,
           status: response.status,
         },
       };
+    },
+
+    /** Show the audit trail, newest first, with a chain verdict. */
+    async auditLog(body) {
+      if (config.audit.enabled !== true) {
+        return { ok: false, code: 'audit-disabled', message: 'the audit log is turned off' };
+      }
+      const limit = clamp(toInteger(asObject(body).limit, 100), 1, 500);
+      return {
+        ok: true,
+        value: {
+          entries: audit.list(limit),
+          total: audit.size(),
+          chain: audit.verify(),
+        },
+      };
+    },
+
+    /**
+     * Unlock the vault for this process.
+     *
+     * The password arrives over the same-origin bridge, is used to derive the
+     * key, and is never stored: reloading the page locks it again unless the
+     * password is also present in the configured environment variable.
+     */
+    async unlock(body) {
+      if (runtime.vault === undefined || runtime.vault.enabled !== true) {
+        return { ok: false, code: 'vault-disabled', message: 'the vault is not enabled in the configuration' };
+      }
+      const candidate = typeof asObject(body).password === 'string' ? asObject(body).password : '';
+      if (candidate.length === 0) {
+        return { ok: false, code: 'empty-password', message: 'the master password is empty' };
+      }
+      const result = runtime.vault.unlock(candidate);
+      audit?.append({
+        actor: 'user', action: result.ok ? 'vault.unlock' : 'vault.lock',
+        detail: { ok: result.ok, reason: result.reason ?? null },
+      });
+      if (!result.ok) {
+        return { ok: false, code: 'wrong-password', message: result.reason ?? 'the vault did not open' };
+      }
+      await migrateIntoVault(runtime);
+      return { ok: true, value: await status() };
+    },
+
+    /** Forget the master password and the decrypted keys. */
+    async lock() {
+      runtime.vault?.lock();
+      audit?.append({ actor: 'user', action: 'vault.lock', detail: { ok: true } });
+      return { ok: true, value: await status() };
     },
   };
 
@@ -1306,6 +2003,9 @@ function createBridge(ctx, config, platforms, trust, declaredAccounts) {
     ['/set', 'set'],
     ['/clear', 'clear'],
     ['/verify', 'verify'],
+    ['/audit', 'auditLog'],
+    ['/unlock', 'unlock'],
+    ['/lock', 'lock'],
   ];
 
   return routes.map(([suffix, name]) => ({
@@ -1351,7 +2051,8 @@ function createBridge(ctx, config, platforms, trust, declaredAccounts) {
  * It only runs once per account, never overwrites a key the new layout already
  * holds, and never deletes the old record.
  */
-async function migrateFromGitHubPlugin(ctx, config) {
+async function migrateFromGitHubPlugin(runtime) {
+  const { ctx, config, audit } = runtime;
   const credentials = ctx.get('credentials');
   if (credentials === undefined || config.migrateGitHub !== true) return;
 
@@ -1360,6 +2061,23 @@ async function migrateFromGitHubPlugin(ctx, config) {
     if (!key.startsWith('dsh-github/')) continue;
     const account = normalizeAccountName(key.slice('dsh-github/'.length));
     if (account === undefined) continue;
+
+    // When the vault is on and unlocked it is the destination, so the adopted
+    // key lands encrypted rather than as a fresh plaintext record.
+    if (runtime.vault !== undefined && runtime.vault.enabled && runtime.vault.state === 'unlocked') {
+      if (runtime.vault.get('github', account) !== undefined) continue;
+      const previous = await credentials.readRecord(key);
+      if (previous === undefined || previous === null
+        || previous.kind !== 'api-key'
+        || typeof previous.key !== 'string' || previous.key.length === 0) continue;
+      runtime.vault.set('github', account, previous.key);
+      audit?.append({
+        actor: 'migration', action: 'vault.migrate', platform: 'github', account,
+        detail: { from: 'dsh-github (earlier plugin layout)', to: 'vault' },
+      });
+      ctx.logger?.info?.(`apikeys: adopted the GitHub key for "${account}" from the earlier plugin layout into the vault`);
+      continue;
+    }
 
     const target = `${CREDENTIAL_SCOPE}/${recordId('github', account)}`;
     if (await credentials.readRecord(target) !== undefined) continue;
@@ -1375,6 +2093,63 @@ async function migrateFromGitHubPlugin(ctx, config) {
 }
 
 /**
+ * Move keys from the credential store into the vault.
+ *
+ * At-rest encryption only means something if the plaintext copy goes away, so
+ * this deletes each record the vault has taken. It runs on unlock, is skipped
+ * when `vault.migrateCredentials` is false, and never deletes a record it could
+ * not first write to the vault.
+ *
+ * This is also the upgrade path for anyone who has been using the plugin with
+ * the credential store: turning the vault on moves their keys in, and nothing
+ * has to be re-entered.
+ */
+async function migrateIntoVault(runtime) {
+  const { ctx, config, vault, audit } = runtime;
+  if (vault === undefined || vault.enabled !== true || vault.state !== 'unlocked') return { moved: 0 };
+  if (config.vault.migrateCredentials !== true) return { moved: 0 };
+
+  const credentials = ctx.get('credentials');
+  if (credentials === undefined) return { moved: 0 };
+
+  let moved = 0;
+  for (const entry of await credentials.listRecords()) {
+    const recordKey = String(entry?.key ?? '');
+    if (!recordKey.startsWith(`${CREDENTIAL_SCOPE}/`)) continue;
+    const id = recordKey.slice(CREDENTIAL_SCOPE.length + 1);
+    // `<platform>-<account>`; platform ids and account names carry no dash, so
+    // the single separator is unambiguous.
+    const separator = id.indexOf('-');
+    if (separator <= 0) continue;
+    const platform = normalizeLooseName(id.slice(0, separator));
+    const account = normalizeAccountName(id.slice(separator + 1));
+    if (platform === undefined || account === undefined) continue;
+
+    const record = await credentials.readRecord(recordKey);
+    if (record === undefined || record === null
+      || record.kind !== 'api-key'
+      || typeof record.key !== 'string' || record.key.length === 0) continue;
+
+    try {
+      if (vault.get(platform, account) === undefined) {
+        vault.set(platform, account, record.key);
+      }
+      // Only remove the plaintext after the encrypted copy is written.
+      await credentials.deleteRecord(recordKey);
+      moved += 1;
+      audit?.append({
+        actor: 'migration', action: 'vault.migrate', platform, account,
+        detail: { from: 'credential store', to: 'vault' },
+      });
+    } catch (error) {
+      ctx.logger?.warn?.(`apikeys: could not move ${recordKey} into the vault: ${String(error)}`);
+    }
+  }
+  if (moved > 0) ctx.logger?.info?.(`apikeys: moved ${moved} key(s) from the credential store into the vault`);
+  return { moved };
+}
+
+/**
  * Mount the tools and the bridge. Each registration is an effect owned by this
  * plugin, so unloading removes both surfaces.
  * @param ctx - the plugin context.
@@ -1383,24 +2158,61 @@ async function migrateFromGitHubPlugin(ctx, config) {
 function apply(ctx, rawConfig) {
   const config = readConfig(rawConfig);
   const platforms = resolvePlatforms(config);
-  // Account names registered from the settings page but not yet backed by a
-  // stored key. Shared by the tools and the bridge so both see the same set.
-  const declaredAccounts = [];
+
+  // Everything mutable about this plugin, shared by the tools and the bridge so
+  // both see the same vault, the same audit chain and the same health state.
+  const runtime = {
+    ctx,
+    config,
+    platforms,
+    // Account names registered from the settings page but not yet backed by a
+    // stored key.
+    declaredAccounts: [],
+    vault: createVaultStore({ file: config.vault.file, enabled: config.vault.enabled }),
+    audit: config.audit.enabled
+      ? createAuditLog({ file: config.audit.file, maxEntries: config.audit.maxEntries })
+      : undefined,
+    redactor: createRedactor({
+      enabled: config.redact.enabled,
+      patterns: config.redact.patterns,
+      replaceWith: config.redact.replaceWith,
+    }),
+    health: createHealthStore({ file: config.health.file }),
+  };
+
   // Trusted authorities for the key bridge. The deployment's own trusted hosts
   // join this list when the Web startup facts are available; without them the
   // bridge answers loopback requests only.
   const trust = { hosts: [] };
 
+  // Unlock the vault as early as the environment allows. A missing password is
+  // not an error: the plugin stays usable and the settings page offers unlock.
+  if (config.vault.enabled) {
+    const password = process.env[config.vault.passwordEnv];
+    if (typeof password === 'string' && password.length > 0) {
+      const result = runtime.vault.unlock(password);
+      if (result.ok) {
+        runtime.audit?.append({ actor: 'startup', action: 'vault.unlock', detail: { ok: true, source: 'environment' } });
+      } else {
+        ctx.logger?.warn?.(`apikeys: the vault did not unlock from ${config.vault.passwordEnv}: ${result.reason}`);
+      }
+    } else if (runtime.vault.exists()) {
+      ctx.logger?.warn?.(
+        `apikeys: the vault is locked — set ${config.vault.passwordEnv} or unlock it in Settings → API Keys`,
+      );
+    }
+  }
+
   ctx.inject(['tools'], (toolsCtx) => {
     toolsCtx.effect(() => {
-      registerTools(toolsCtx, config, platforms, declaredAccounts);
+      registerTools(runtime);
       return () => {};
     }, 'dsh-apikeys: tools');
   });
 
   ctx.inject(['webServer'], (serverCtx) => {
     serverCtx.effect(() => {
-      const disposers = createBridge(serverCtx, config, platforms, trust, declaredAccounts)
+      const disposers = createBridge(runtime, trust)
         .map((route) => serverCtx.webServer.register(route));
       return () => {
         for (const dispose of disposers) dispose();
@@ -1411,8 +2223,14 @@ function apply(ctx, rawConfig) {
   ctx.inject(['credentials'], (credentialsCtx) => {
     credentialsCtx.effect(() => {
       let cancelled = false;
-      migrateFromGitHubPlugin(credentialsCtx, config).catch((error) => {
-        if (!cancelled) ctx.logger?.warn?.(`apikeys: could not adopt the earlier GitHub key: ${String(error)}`);
+      const run = async () => {
+        await migrateFromGitHubPlugin(runtime);
+        if (runtime.vault.enabled && runtime.vault.state === 'unlocked') {
+          await migrateIntoVault(runtime);
+        }
+      };
+      run().catch((error) => {
+        if (!cancelled) ctx.logger?.warn?.(`apikeys: key migration failed: ${String(error)}`);
       });
       return () => {
         cancelled = true;
@@ -1443,13 +2261,25 @@ function apply(ctx, rawConfig) {
     }, 'dsh-apikeys: bridge trust');
   });
 
+  // Drop the decrypted keys when the plugin unloads.
+  ctx.effect(() => () => {
+    runtime.vault?.lock();
+  }, 'dsh-apikeys: wipe the vault on unload');
+
   ctx.logger?.info?.(
     `apikeys: ${platforms.size} platform(s) [${[...platforms.keys()].join(', ')}], `
     + `default ${config.defaultPlatform}/${config.defaultAccount}, `
     + `key reveal ${config.exposeKeys ? 'enabled' : 'disabled'}, `
-    + `environment fallback ${config.envFallback ? 'on' : 'off'}`,
+    + `environment fallback ${config.envFallback ? 'on' : 'off'}, `
+    + `vault ${config.vault.enabled ? runtime.vault.state : 'off'}, `
+    + `audit ${config.audit.enabled ? 'on' : 'off'}, `
+    + `redact ${config.redact.enabled ? 'on' : 'off'}, `
+    + `rotation ${config.rotation.enabled ? 'on' : 'off'}`,
   );
 }
 
 export { Config, apply };
 export const name = 'apikeys';
+// Surfaced for the out-of-band CLI, which needs the same platform table and the
+// same config interpretation the plugin uses — one authority, not a copy.
+export { BUILTIN_PLATFORMS, readConfig, resolvePlatforms };

@@ -1,6 +1,6 @@
 {
   "meta": {
     "title": "API Keys",
-    "description": "Stores API keys for GitHub, Cloudflare, Vercel, npm, Docker Hub, Hugging Face and your own platforms, and gives the model apikey_call, apikey_platforms and apikey_key so it can call their APIs as you."
+    "description": "A credential proxy for outbound API calls: keeps keys for GitHub, Cloudflare, Vercel, npm, Docker Hub, Hugging Face and your own platforms — in the DSH credential store, or in an optional AES-256-GCM vault unlocked by a master password — and gives the model apikey_call, apikey_platforms, apikey_key and apikey_upload so it can call their APIs as you without holding the key. Includes response redaction, a hash-chained audit log, per-platform credential failover and an out-of-band CLI."
   }
 }

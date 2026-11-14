@@ -1,6 +1,6 @@
 {
   "meta": {
     "title": "API Keys",
-    "description": "统一存放 GitHub、Cloudflare、Vercel、npm、Docker Hub、Hugging Face 以及自定义平台的 API Key，并向模型提供 apikey_call、apikey_platforms、apikey_key，让它能以你的身份调用这些 API。"
+    "description": "出站 API 调用的凭证代理：把 GitHub、Cloudflare、Vercel、npm、Docker Hub、Hugging Face 以及自定义平台的 Key 存进 DSH 凭据库，或存进可选的 AES-256-GCM 加密保管库（用主密码解锁），并向模型提供 apikey_call、apikey_platforms、apikey_key、apikey_upload，让它能以你的身份调用这些 API 而不持有 Key。包含响应脱敏、哈希链审计日志、按平台的凭证故障转移，以及一个带外 CLI。"
   }
 }
