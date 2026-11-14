@@ -178,7 +178,7 @@ All fields are optional; the shipped patch sets the defaults.
 | `enabledPlatforms` | all built-ins | Which built-in platforms to expose. |
 | `accounts` | `[]` | Account names to keep visible before they hold a key. |
 | `customPlatforms` | `[]` | Your own platform definitions. |
-| `exposeKeys` | `true` | Whether `apikey_key get` may return a key value. Set `false` to keep keys inside the Host. |
+| `exposeKeys` | `false` | Whether `apikey_key get` may return a key value. A returned key enters the session log, so this is off by default; turn it on only when a task needs the key itself. |
 | `envFallback` | `true` | Fall back to each platform's environment variable for its default account. |
 | `maxResponseChars` | `20000` | Response body cap per call (2000–400000). |
 | `requestTimeoutMs` | `30000` | Per-request timeout (1000–180000). |
@@ -209,8 +209,8 @@ Change them in your profile's `cordis.patch.yml`:
 ```yaml
 - id: apikeys
   config:
-    exposeKeys: false
     enabledPlatforms: [github, cloudflare]
+    exposeKeys: true          # off by default; a returned key enters the session log
     vault:
       enabled: true
     rotation:

@@ -1,6 +1,6 @@
 {
   "name": "dsh-apikeys-plugin",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "Multi-platform API keys for DeepSeek Harness: keeps keys for GitHub, Cloudflare, Vercel, npm, Docker Hub, Hugging Face and custom platforms in the DSH credential store or an encrypted vault, and exposes apikey_call / apikey_platforms / apikey_key / apikey_upload so the model can call their APIs with your identity without holding the key.",
   "type": "module",
   "exports": {

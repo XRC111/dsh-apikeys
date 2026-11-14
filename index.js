@@ -246,8 +246,8 @@ const Config = z.object({
   })).default([]).description(
     'Your own platforms: baseUrl, auth shape, and an optional verification endpoint.',
   ),
-  exposeKeys: z.boolean().default(true).description(
-    'Whether apikey_key get may return a key value. Turn off to keep keys inside the Host.',
+  exposeKeys: z.boolean().default(false).description(
+    'Whether apikey_key get may return a key value to the model. Off by default, because a value returned to the model enters the session log — turn it on only when a task genuinely needs the key itself.',
   ),
   envFallback: z.boolean().default(true).description(
     "Fall back to each platform's environment variable for its default account.",
@@ -340,7 +340,10 @@ function readConfig(raw) {
           })
           .filter(Boolean)
       : [],
-    exposeKeys: config.exposeKeys !== false,
+    // Off by default. A key returned to the model is written into the session
+    // log, so revealing one has to be a deliberate act rather than the
+    // out-of-the-box behaviour.
+    exposeKeys: config.exposeKeys === true,
     envFallback: config.envFallback !== false,
     maxResponseChars: clamp(toInteger(config.maxResponseChars, 20000), 2000, 400000),
     requestTimeoutMs: clamp(toInteger(config.requestTimeoutMs, 30000), 1000, 180000),

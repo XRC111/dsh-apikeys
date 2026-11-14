@@ -132,7 +132,7 @@ if (typeof plugin.Config === 'function') {
     Array.isArray(defaults.enabledPlatforms) && defaults.enabledPlatforms.length === 6,
     'Config default: six enabled platforms',
   );
-  check(defaults.exposeKeys === true, 'Config default: exposeKeys');
+  check(defaults.exposeKeys === false, 'Config default: exposeKeys is off, because a returned key enters the session log');
   check(defaults.envFallback === true, 'Config default: envFallback');
   check(defaults.maxResponseChars === 20000, 'Config default: maxResponseChars');
   check(Array.isArray(defaults.accounts), 'Config accepts an accounts list');
@@ -141,7 +141,7 @@ if (typeof plugin.Config === 'function') {
   // A hand-written row must still resolve, since patch files predate the schema.
   const partial = plugin.Config({ defaultPlatform: 'npm' });
   check(partial.defaultPlatform === 'npm', 'Config keeps a supplied value');
-  check(partial.exposeKeys === true, 'Config fills the rest from defaults');
+  check(partial.exposeKeys === false, 'Config fills the rest from defaults')
 
   // The defaults the schema produces must match what readConfig would decide.
   const mounted = [];
@@ -536,6 +536,27 @@ check(records.get('dsh-apikeys/github-default')?.key === 'newerKey', 'an existin
 
 // ----------------------------------------------------------- configuration
 console.log('configuration');
+
+// The default is the important case: a configuration that never mentions
+// exposeKeys must not hand keys to the model, because a returned key is
+// written into the session log.
+{
+  const defaults = [];
+  const defaultCtx = makeContext();
+  defaultCtx.tools = { register(definition) { defaults.push(definition); return () => {}; } };
+  apply(defaultCtx, { enabledPlatforms: ['github'], defaultPlatform: 'github' });
+  let defaultRefused = null;
+  try {
+    await defaults.find((tool) => tool.name === 'apikey_key').execute(
+      { action: 'get', platform: 'github' }, exec,
+    );
+  } catch (error) { defaultRefused = error.message; }
+  check(
+    defaultRefused !== null && defaultRefused.includes('exposeKeys'),
+    'without an exposeKeys setting, apikey_key get is refused',
+  );
+}
+
 const offRegistry = [];
 const offCtx = makeContext();
 offCtx.tools = { register(definition) { offRegistry.push(definition); return () => {}; } };
@@ -553,7 +574,13 @@ check(stillStores.ok === true, 'exposeKeys:false still allows storing a key');
 const fallbackOff = [];
 const fbCtx = makeContext();
 fbCtx.tools = { register(definition) { fallbackOff.push(definition); return () => {}; } };
-apply(fbCtx, { envFallback: false, enabledPlatforms: ['github'], defaultPlatform: 'github' });
+apply(fbCtx, {
+  envFallback: false,
+  // Reading a key needs the opt-in; this case is about resolution, not exposure.
+  exposeKeys: true,
+  enabledPlatforms: ['github'],
+  defaultPlatform: 'github',
+});
 const noFallbackGet = await fallbackOff.find((tool) => tool.name === 'apikey_key')
   .execute({ action: 'get', platform: 'github', account: 'ghost' }, exec);
 check(noFallbackGet.configured === false, 'envFallback:false leaves an unset account unconfigured');

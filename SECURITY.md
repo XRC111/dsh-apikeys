@@ -37,7 +37,7 @@ determined attacker with access to your machine.**
 
 DSH's local credential file is readable by your OS user, and agent tool
 processes run as that user. A key stored here cannot be hidden from a process
-running as you. `exposeKeys: false` is a guardrail against accidental
+running as you. `exposeKeys: false` — the default — is a guardrail against accidental
 disclosure, not a sandbox.
 
 ---
@@ -94,7 +94,12 @@ require it.
 
 ---
 
-## 3. `exposeKeys: false`
+## 3. `exposeKeys` (off by default)
+
+`exposeKeys` defaults to **`false`**, so with no configuration at all a key is
+never returned to the model. That is deliberate: a value returned to the model
+is written into the session log, where it outlives the request and is much
+harder to withdraw than a setting.
 
 With `exposeKeys: false`, `apikey_key get` throws before reading anything. The
 question this section answers: **can the key still reach the model through some
@@ -118,7 +123,7 @@ Channels audited:
 The URL channel was a real defect, found while writing this document: with
 `auth.kind: 'query'`, `applyQueryAuth` writes the key into `url.searchParams`,
 and the result carried `url: url.toString()` back to the model — which would
-have revealed the key despite `exposeKeys: false`. It is fixed in 1.1.0 and
+have revealed the key despite `exposeKeys: false`. It is fixed in 1.2.0 and
 covered by a regression test (`dev/integration-tests.mjs`, section
 `query auth`), including the case where redaction is turned off: masking the URL
 is not a setting.

@@ -18,7 +18,7 @@
 #   enabledPlatforms: [...]        built-ins to expose; omit for all of them
 #   accounts: []                   account names to keep visible before they hold a key
 #   customPlatforms: []            your own platforms; see the shape below
-#   exposeKeys: true               allow apikey_key get to return a key value
+#   exposeKeys: false              allow apikey_key get to return a key value (off: a returned key enters the session log)
 #   envFallback: true              fall back to each platform's environment variable
 #   maxResponseChars: 20000        response body cap per call (2000-400000)
 #   requestTimeoutMs: 30000        per-request timeout (1000-180000)
@@ -54,7 +54,7 @@
           - huggingface
         customPlatforms: []
         accounts: []
-        exposeKeys: true
+        exposeKeys: false
         envFallback: true
         maxResponseChars: 20000
         requestTimeoutMs: 30000
